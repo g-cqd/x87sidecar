@@ -51,6 +51,12 @@ static void test_extended_rounding(void) {
     } cases[] = {
         {0x8000000000000400, 0x3fff, 0x3ff0000000000000},  // even tie
         {0x8000000000000c00, 0x3fff, 0x3ff0000000000002},  // odd tie
+        {0x8000000000000401, 0x4000, 0x4000000000000001},  // just above tie
+        {0xfffffffffffffc00, 0x3fff, 0x4000000000000000},  // carry into exponent
+        {0xfffffffffffff800, 0x3c00, 0x0010000000000000},  // round to minimum normal
+        {0x8000000000000000, 0x3c01, 0x0010000000000000},  // minimum normal
+        {0xfffffffffffff800, 0x43fe, 0x7fefffffffffffff},  // maximum normal
+        {0xfffffffffffff800, 0x43ff, 0x7ff0000000000000},  // overflow with fraction
         {0x8000000000000000, 0x3bcc, 0},                   // half minimum subnormal
         {0x8000000000000001, 0x3bcc, 1},
         {0x8000000000000000, 0xbbcc, 0x8000000000000000},
@@ -114,9 +120,75 @@ static void test_fxsave_payload(void) {
     failures += bad != 0;
 }
 
+static void test_boundary_occupancy(void) {
+    unsigned char source[512] __attribute__((aligned(16)));
+    unsigned char result[512] __attribute__((aligned(16)));
+    const double values[8] = {1.25,
+                              -2.5,
+                              0.0,
+                              -0.0,
+                              0x1p-1074,
+                              0x1.fffffffffffffp1023,
+                              __builtin_inf(),
+                              __builtin_nan("")};
+    __asm__ volatile("fninit; fxsave %0" : "=m"(source) : : "memory", "st");
+    for (unsigned i = 0; i < 8; ++i) {
+        long double native = values[i];
+        memcpy(source + 32 + 16 * i, &native, 10);
+    }
+    int bad = 0;
+    for (unsigned top = 0; top < 8; ++top) {
+        uint16_t status = (uint16_t)(top << 11);
+        memcpy(source + 2, &status, 2);
+        for (unsigned mask = 0; mask < 256; ++mask) {
+            source[4] = (unsigned char)mask;
+            unsigned long flags;
+            unsigned long flip = mask & (1U << top);
+            // Alter live ST0 so a symmetric but wrong import/export cannot pass.
+            __asm__ volatile(
+                "fxrstor %2\n"
+                "testq %4, %4; jz 1f\n"
+                "fchs; jmp 2f\n"
+                "1: fnop\n"
+                "2:\n"
+                "cmpq $0, %3\n"
+                "fnop\n"
+                "pushfq; popq %0\n"
+                "fxsave %1; fninit"
+                : "=&r"(flags), "=m"(result)
+                : "m"(source), "r"((unsigned long)mask), "r"(flip)
+                : "memory", "cc", "st", "st(1)", "st(2)", "st(3)", "st(4)", "st(5)", "st(6)",
+                  "st(7)");
+            uint16_t got_status;
+            memcpy(&got_status, result + 2, 2);
+            int mismatch = result[4] != mask || (got_status & 0x3800) != status ||
+                           !!(flags & 0x40) != (mask == 0) || (flags & 0x801) != 0;
+            for (unsigned i = 0; i < 8; ++i) {
+                unsigned physical = (top + i) & 7;
+                if (mask & (1U << physical)) {
+                    for (unsigned byte = 0; byte < 10; ++byte) {
+                        unsigned offset = 32 + 16 * i + byte;
+                        unsigned char expected = source[offset];
+                        if (i == 0 && byte == 9 && flip)
+                            expected ^= 0x80;
+                        if (result[offset] != expected)
+                            mismatch = 1;
+                    }
+                }
+            }
+            if (mismatch && bad++ < 5)
+                printf("FAIL  boundary occupancy top=%u mask=%02x\n", top, mask);
+        }
+    }
+    printf("%s  native boundary: 256 occupancy masks at eight TOP positions\n",
+           bad ? "FAIL" : "PASS");
+    failures += bad != 0;
+}
+
 int main(void) {
     test_boundary_bits();
     test_extended_rounding();
     test_fxsave_payload();
+    test_boundary_occupancy();
     return failures ? 1 : 0;
 }

@@ -50,6 +50,38 @@ void emit_f80_to_f64_convert(AssemblerBuffer& buf, int Xmant_inout, int Wexp, in
     is_bitmask_immediate(/*is_64bit=*/false, 0x7FFFU, enc_15bits);
     emit_and_imm(buf, /*is_64bit=*/0, Wexp, enc_15bits.N, enc_15bits.immr, enc_15bits.imms, Wexp);
 
+    const auto nonzero_mantissa = buf.end;
+    emit_cbz(buf, 1, 1, Xmant_inout, 0);
+    const auto nonzero_exponent = buf.end;
+    emit_cbz(buf, 0, 1, Wexp, 0);
+    emit_bitfield(buf, 1, 1, 1, 1, 0, Xsign, Xmant_inout);
+    const auto zero_done = buf.end;
+    emit_b(buf, 0);
+    buf.data[nonzero_mantissa / 4] |= static_cast<uint32_t>((buf.end - nonzero_mantissa) / 4) << 5;
+    buf.data[nonzero_exponent / 4] |= static_cast<uint32_t>((buf.end - nonzero_exponent) / 4) << 5;
+
+    // Reply boundaries usually import an exact binary64 normal. Guard both
+    // range and discarded bits before bypassing general rounding below.
+    emit_add_imm(buf, 0, 1, 0, 1, 4, Wexp, Wd_tmp);
+    emit_add_imm(buf, 0, 0, 0, 0, 0x3ff, Wd_tmp, Wd_tmp);
+    emit_add_imm(buf, 0, 1, 1, 0, 0x7fd, Wd_tmp, 31);
+    const auto non_normal = buf.end;
+    emit_b_cond(buf, 8 /*HI*/, 0);
+    LogicalImmEncoding discarded_bits;
+    is_bitmask_immediate(true, 0x7ff, discarded_bits);
+    emit_logical_imm(buf, 1, 3, discarded_bits.N, discarded_bits.immr, discarded_bits.imms,
+                     Xmant_inout, 31);
+    const auto needs_rounding = buf.end;
+    emit_b_cond(buf, 1 /*NE*/, 0);
+    emit_bitfield(buf, 1, 2, 1, 11, 62, Xmant_inout, Xmant_inout);
+    emit_add_imm(buf, 0, 0, 0, 0, 1, Wd_tmp, Wd_tmp);
+    emit_bitfield(buf, 1, 1, 1, 12, 10, Wd_tmp, Xmant_inout);
+    emit_bitfield(buf, 1, 1, 1, 1, 0, Xsign, Xmant_inout);
+    const auto exact_done = buf.end;
+    emit_b(buf, 0);
+    buf.data[non_normal / 4] |= static_cast<uint32_t>((buf.end - non_normal) / 4) << 5;
+    buf.data[needs_rounding / 4] |= static_cast<uint32_t>((buf.end - needs_rounding) / 4) << 5;
+
     // Small extended exponents produce binary64 subnormals. Handle them
     // separately so native state can cross a reply boundary losslessly.
     emit_movn(buf, 0, 2, 0, 0x3c00, Wd_aux);
@@ -162,6 +194,8 @@ void emit_f80_to_f64_convert(AssemblerBuffer& buf, int Xmant_inout, int Wexp, in
     emit_bitfield(buf, 1, 1, 1, 1, 0, Xsign, Xmant_inout);
     buf.data[small_done / 4] = 0x14000000U | static_cast<uint32_t>((buf.end - small_done) / 4);
     buf.data[normal_done / 4] = 0x14000000U | static_cast<uint32_t>((buf.end - normal_done) / 4);
+    buf.data[exact_done / 4] = 0x14000000U | static_cast<uint32_t>((buf.end - exact_done) / 4);
+    buf.data[zero_done / 4] = 0x14000000U | static_cast<uint32_t>((buf.end - zero_done) / 4);
 }
 
 // =============================================================================
@@ -283,17 +317,18 @@ void emit_native_state_boundary(TranslationResult& tr, bool entering) {
     emit_ldr_str_imm(buf, 1, 0, 1, 2, base, exp);
     // The empty-stack path leaves NZCV untouched. Adding one to a loaded
     // halfword sets bit 16 exactly when every tag is empty (0xffff).
-    emit_add_imm(buf, 0, 0, 0, 0, 1, exp, exp);
+    emit_add_imm(buf, 0, 0, 0, 0, 1, exp, aux);
     const auto empty = buf.end;
-    buf.emit(0x37000000U | (16U << 19) | exp);  // TBNZ Wexp, #16, .done
+    buf.emit(0x37000000U | (16U << 19) | aux);  // TBNZ Waux, #16, .done
     emit_mrs_nzcv(buf, flags);
+    // Bit 2*i is set exactly for an empty tag (11). Keep these bits above
+    // NZCV[31:28], which MSR alone consumes, while conversion reuses exp.
+    emit_logical_shifted_reg(buf, 0, 0, 0, 1, exp, 1, exp, exp);
+    emit_bitfield(buf, 1, 1, 1, 32, 15, exp, flags);
     for (int j = 0; j < 8; ++j) {
         const int i = entering ? j : 7 - j;
-        emit_ldr_str_imm(buf, 1, 0, 1, 2, base, exp);
-        emit_bitfield(buf, 0, 2, 0, 2 * i, 2 * i + 1, exp, exp);
-        emit_add_imm(buf, 0, 1, 1, 0, 3, exp, 31);
         const auto skip = buf.end;
-        emit_b_cond(buf, 0, 0);
+        buf.emit(0xb7000000U | (static_cast<uint32_t>(2 * i) << 19) | flags);
         if (entering) {
             emit_ldur_stur(buf, 3, 1, 6 + 10 * i, base, mant);
             emit_ldr_str_imm(buf, 1, 0, 1, (14 + 10 * i) / 2, base, exp);
@@ -304,7 +339,7 @@ void emit_native_state_boundary(TranslationResult& tr, bool entering) {
             emit_ldr_str_imm(buf, 3, 1, 1, 1 + i, base, fp);
             TranslatorX87::emit_f64_to_f80(buf, sign, fp, mant, exp, tmp);
         }
-        buf.data[skip / 4] = 0x54000000U | (static_cast<uint32_t>((buf.end - skip) / 4) << 5);
+        buf.data[skip / 4] |= static_cast<uint32_t>((buf.end - skip) / 4) << 5;
     }
     emit_msr_nzcv(buf, flags);
     buf.data[empty / 4] |= static_cast<uint32_t>((buf.end - empty) / 4) << 5;
