@@ -301,10 +301,12 @@ check_output() {
 # so adding a fallback cannot silently turn signal recovery coverage stock-only.
 export X87_DISABLE_STOCK_COMPAT=1
 
-# Host-side storage coverage runs even when only native Rosetta is available.
-EXIT=0
-OUT=$("$BIN/test_assembler_buffer" 2>&1) || EXIT=$?
-check_output test_assembler_buffer "$OUT" "$EXIT"
+# Host-side boundary coverage runs even when only native Rosetta is available.
+for test in test_assembler_buffer test_sidecar_transaction; do
+    EXIT=0
+    OUT=$("$BIN/$test" 2>&1) || EXIT=$?
+    check_output "$test" "$OUT" "$EXIT"
+done
 
 # ── Phase 1: native Rosetta ───────────────────────────────────────────────────
 echo -e "${BOLD}=== Phase 1: native Rosetta ===${NC}"

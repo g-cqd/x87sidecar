@@ -4,6 +4,11 @@ set(X86_SAMPLE_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/tests")
 add_executable(test_assembler_buffer test_assembler_buffer.cpp)
 target_link_libraries(test_assembler_buffer PRIVATE rosetta_core)
 
+add_executable(test_sidecar_transaction test_sidecar_transaction.cpp
+    ../rosetta_loader/src/guest_pc_map.cpp
+    ../rosetta_loader/src/x87_trace.cpp)
+target_link_libraries(test_sidecar_transaction PRIVATE rosetta_core)
+
 add_x86_sample(test_fldconst)
 add_x86_sample(test_detach_signals)
 add_x86_sample(test_fld)
