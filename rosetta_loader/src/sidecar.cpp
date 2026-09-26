@@ -2159,6 +2159,24 @@ mach_vm_address_t allocAndAppendInParent(mach_port_t parentTask, uint64_t origAd
 TranslateOutcome processTranslateRequest(mach_port_t parentTask, const TranslateRequest& req) {
     TranslateOutcome out{.reply_some = false, .value = 0};
 
+    // Stock may clobber cached registers after any None reply, including a
+    // failed write-back after translation. Preserve the cache only when the
+    // complete result has reached the parent and a Some reply is ready.
+    struct CacheCommitGuard {
+        uint64_t tr_addr;
+        bool committed = false;
+        ~CacheCommitGuard() {
+            if (!committed) {
+                std::scoped_lock lk(g_x87CacheMu);
+                auto it = g_x87Cache.find(tr_addr);
+                if (it != g_x87Cache.end()) {
+                    it->second.invalidate();
+                    it->second.prev_block = nullptr;
+                }
+            }
+        }
+    } cache_commit{.tr_addr = req.tr_addr};
+
     // X87_ALWAYS_NONE: short-circuit before any cross-process I/O.  The stub
     // sees a None reply, falls through to STASH, and stock translates the
     // op.  Hook + IPC mechanics still exercise (so we can A/B it against
@@ -2193,28 +2211,6 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         std::scoped_lock lk(g_x87CacheMu);
         tr.x87_cache = g_x87Cache[req.tr_addr];  // default-constructs on first use
     }
-
-    // Any None reply produced WITHOUT running the translator (the early
-    // failure returns below) must not leave the persisted per-TR X87Cache
-    // trusting mid-run registers: stock translates the op itself and
-    // clobbers the GPRs the cache thinks are holding TOP/base, so the next
-    // sidecar-translated op would miscompile.  The translator's own None
-    // paths invalidate in its default case; this guard covers every bypass
-    // in one place.
-    struct CacheBypassGuard {
-        uint64_t tr_addr;
-        bool ran_translator = false;
-        ~CacheBypassGuard() {
-            if (!ran_translator) {
-                std::scoped_lock lk(g_x87CacheMu);
-                auto it = g_x87Cache.find(tr_addr);
-                if (it != g_x87Cache.end()) {
-                    it->second.invalidate();
-                    it->second.prev_block = nullptr;
-                }
-            }
-        }
-    } _bypass_guard{.tr_addr = req.tr_addr};
 
     TransactionalList<Fixup>* lists[kListCount] = {
         &tr.external_fixups, &tr.internal_fixups,  &tr._fixups,
@@ -2452,9 +2448,8 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         }
     }
 
-    // On a stock hit ran_translator stays false and the bypass guard
-    // invalidates the persisted X87Cache, which is what a None reply that
-    // skipped the translator needs.
+    // A stock hit leaves the transaction uncommitted, so the guard
+    // invalidates the persisted register cache before the None reply.
     std::optional<int64_t> result;
     bool allocation_failed = false;
     if (!stock_hash_hit) {
@@ -2462,7 +2457,6 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
             result = Translator::translate_instruction(
                 &tr, reinterpret_cast<IRBlock*>(req.block), localIR,
                 static_cast<int64_t>(req.num_instrs), static_cast<int64_t>(req.insn_idx));
-            _bypass_guard.ran_translator = true;
         } catch (const std::bad_alloc&) {
             std::fprintf(stderr, "[rosettax87] translation allocation failed; using stock\n");
             allocation_failed = true;
@@ -2618,15 +2612,6 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         }
     }
 
-    // Persist OPT-1's cross-instruction cache in our own per-thread map (not the
-    // tracee's TR). Always — even on None, Translator's default case calls
-    // cache.invalidate() and resets scratch masks; dropping that would leave the
-    // next call trusting stale gprs_valid state.
-    {
-        std::scoped_lock lk(g_x87CacheMu);
-        g_x87Cache[req.tr_addr] = tr.x87_cache;
-    }
-
     // Write back only the stock-sized TR (propagates scratch-mask updates and
     // any pivoted buffer pointers from the Some path above). x87_cache is NOT
     // written to the tracee — it lives in g_x87Cache — so the tracee's TR needs
@@ -2636,6 +2621,13 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     }
 
     if (result.has_value()) {
+        // The parent can now use the translated result. Publish its cache
+        // only after every remote write has succeeded.
+        {
+            std::scoped_lock lk(g_x87CacheMu);
+            g_x87Cache[req.tr_addr] = tr.x87_cache;
+        }
+        cache_commit.committed = true;
         out.reply_some = true;
         out.value = result.value();
     } else {
