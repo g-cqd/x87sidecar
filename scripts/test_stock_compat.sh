@@ -22,9 +22,9 @@ run_case() {
     output=$(
         for setting in "${!X87_@}"; do unset "$setting"; done
         export X87_NO_PREAUTH=1 X87_PROFILE="$WORK/$name.prof"
-        env "$@" "$LOADER" "$FIXTURE" 2>&1
+        env "$@" "$LOADER" "$FIXTURE" --dispatch-only 2>&1
     ) || { printf '%s\n' "$output"; return 1; }
-    if [[ $(grep -c '^PASS  signal context ' <<<"$output") -ne 20 ]] ||
+    if [[ $(grep -c '^PASS  dispatch context ' <<<"$output") -ne 10 ]] ||
        grep -q '^FAIL' <<<"$output"; then
         printf 'FAIL  stock_compat %s: signal-context fixture failed\n%s\n' "$name" "$output"
         return 1

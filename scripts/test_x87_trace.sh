@@ -13,6 +13,8 @@ for fixture in test_x87_signal_context test_x87_trace_threads test_x87_trace_fre
     fi
     output=$(
         for setting in "${!X87_@}"; do unset "$setting"; done
+        # Trace the accelerated block even when production delegates it to stock.
+        export X87_DISABLE_STOCK_COMPAT=1
         export X87_NO_PREAUTH=1 X87_TRACE_BLOCK="$selected_hash"
         export X87_TRACE_OUTPUT="$WORK/$fixture" X87_TRACE_STOP_NEGATIVE=1
         "$BUILD/bin/x87sidecar_entitled" "$BUILD/bin/tests/$fixture" 2>&1

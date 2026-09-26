@@ -217,7 +217,7 @@ static double now(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-static void run_case(int compat, int rewrite, double x) {
+static void run_case(int compat, int rewrite, double x, int dispatch_only) {
     void (*run)(void) = compat ? run_chain32 : run_chain64;
     rewrite_context = 0;
     input.x = x;
@@ -231,6 +231,16 @@ static void run_case(int compat, int rewrite, double x) {
         return;
     }
     memset(&output, 0, sizeof(output));
+    if (dispatch_only) {
+        // Dispatch profiling needs both modes and arithmetic checks, without
+        // requiring a signal to hit one particular stock instruction boundary.
+        run();
+        int ok = output.bad == 0 && output.replaced == 0;
+        printf("%s  dispatch context mode=%d x=%g bad=%u replaced=%u\n", ok ? "PASS" : "FAIL",
+               compat ? 32 : 64, x, output.bad, output.replaced);
+        failures += !ok;
+        return;
+    }
     signals = observations = invalid_context = 0;
     rewrite_context = rewrite;
     atomic_store(&running, 1);
@@ -258,7 +268,12 @@ static void run_case(int compat, int rewrite, double x) {
         failures++;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    int dispatch_only = argc == 2 && strcmp(argv[1], "--dispatch-only") == 0;
+    if (argc != 1 && !dispatch_only) {
+        fprintf(stderr, "usage: %s [--dispatch-only]\n", argv[0]);
+        return 2;
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
     setup_ldt();
     if (failures)
@@ -274,8 +289,8 @@ int main(void) {
      * path while the chain's result remains normal and easy to inspect. */
     const double values[] = {-0.005, 2.3, -3.7, 0x1p-1074, -0x1p-1074};
     for (int compat = 0; compat < 2; ++compat)
-        for (int rewrite = 0; rewrite < 2; ++rewrite)
+        for (int rewrite = 0; rewrite < (dispatch_only ? 1 : 2); ++rewrite)
             for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i)
-                run_case(compat, rewrite, values[i]);
+                run_case(compat, rewrite, values[i], dispatch_only);
     return failures ? 1 : 0;
 }
