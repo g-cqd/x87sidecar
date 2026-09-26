@@ -101,6 +101,24 @@ Rosetta itself shifts the x87 stack when a signal lands in its `fcomp`,
 `fcompp` or `ficomp` translations; the harness records that as a stock
 divergence.
 
+## Boundary conversion cost
+
+The boundary computes empty-slot bits once and keeps them in bits 32–47 of
+its saved NZCV register. Only bits 31–28 are restored to NZCV. Conversion
+helpers may reuse the other scratch registers without reloading the tag
+word for each slot. The shrink/expand order still protects overlapping
+source slots.
+
+Signed zero and exact normal binary64 values have guarded packing paths.
+The normal path requires a rebased exponent in 1–2046 and zero discarded
+significand bits. Other values retain the general round-to-nearest-even
+conversion. These guards add work for special values; benchmark normal,
+zero, mixed and special inputs separately with `bench_native_boundary`.
+
+`test_x87_native_state` covers every occupancy mask and TOP position and
+changes live ST0 before checking native payloads. An opaque round trip
+alone would miss some symmetric conversion errors.
+
 ## Encodings Rosetta's decoder rejects
 
 Two encodings that real hardware runs are absent from Rosetta's decode
