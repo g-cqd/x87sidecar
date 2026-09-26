@@ -6,6 +6,31 @@
 #include <string>
 #include <vector>
 
+// Exact on-disk code bytes that must match the loaded image before native calls.
+struct RuntimeCodeCheck {
+    std::uint64_t offset;
+    std::vector<std::uint8_t> bytes;
+};
+
+// Validated stock allocation entry points; zero offsets mean unsupported code.
+struct RuntimeAllocatorDiscovery {
+    std::uint64_t grow = 0;
+    std::uint64_t arenaAllocate = 0;
+    std::uint64_t arenaPointer = 0;
+    std::vector<RuntimeCodeCheck> codeChecks;
+};
+
+// Accepts only the audited assembler/arena allocation contract and bounded call
+// targets. The ranges are image-relative, half-open text and writable-data spans.
+auto discoverRuntimeAllocator(const std::vector<std::uint8_t>& image, std::uint64_t textBegin,
+                              std::uint64_t textEnd, std::uint64_t dataBegin, std::uint64_t dataEnd)
+    -> RuntimeAllocatorDiscovery;
+
+// Accepts the audited runtime caller only when both external translation locks
+// remain held through its translator import call. Empty means unsupported code.
+auto discoverAllocatorCaller(const std::vector<std::uint8_t>& image, std::uint64_t textBegin,
+                             std::uint64_t textEnd) -> std::vector<RuntimeCodeCheck>;
+
 // Everything the loader patches or reads inside Rosetta is located here, from
 // the two on-disk images, before anything is launched:
 //
@@ -27,6 +52,7 @@ struct OffsetFinder {
     auto determineRuntimeOffsets() -> bool;
 
     // /usr/libexec/rosetta/runtime
+    std::vector<RuntimeCodeCheck> allocatorCallerCodeChecks_;
     std::uint64_t offsetExportsFetch_ = 0;
     std::uint64_t offsetSvcCallEntry_ = 0;
     std::uint64_t offsetSvcCallRet_ = 0;
@@ -37,6 +63,10 @@ struct OffsetFinder {
     std::uint64_t armTreeRootOffset_ = 0;
 
     // libRosettaRuntime
+    std::uint64_t offsetAssemblerBufferGrow_ = 0;
+    std::uint64_t offsetArenaAllocate_ = 0;
+    std::uint64_t offsetArenaPointer_ = 0;
+    std::vector<RuntimeCodeCheck> allocatorCodeChecks_;
     std::uint64_t offsetTransactionResultSize_ = 0;
     std::uint64_t offsetTranslateInsn_ = 0;
     std::uint64_t offsetInitLibrary_ = 0;

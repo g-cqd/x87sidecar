@@ -8,6 +8,8 @@
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/Opcode.h"
 #include "rosetta_core/OpcodeCompatibility.h"
+#include "rosetta_core/TranslationResult.h"
+#include "translation_reply.hpp"
 
 namespace stub_asm {
 namespace {
@@ -541,21 +543,23 @@ void append_abort_msg_template(std::vector<uint8_t>& out) {
 //   sp[ 64..128] : 64-byte mach_msg buffer.  Send: header (24 B at +64..
 //                  +88) + 5×8 args body (40 B at +88..+128).  RCV is
 //                  capped at 64 B (kernel never writes past sp+128).
-//                  Reply layout: header (24 B) + result (8 B at +88) +
-//                  some_flag (8 B at +96).
+//                  Reply: header + result/capacity (+88), kind (+96),
+//                  two fixup capacities (+104/+112), then 8-byte trailer.
 //   sp[128..132] : expected msgh_id stash (Step 1b transaction-id check).
-//   sp[132..192] : currently unused.
+//   sp[132..136] : whether this request has already reserved storage.
+//   sp[136..192] : unused.
 //
 // After the trap returns:
 //   x0 = KERN_RETURN.  Reply at sp+64.. is validated then dispatched on
-//   some_flag (sp+96): 0 = None (fall through to STASH), 1 = Some
-//   (return result at sp+88 in x0).
+//   kind (sp+96): None falls through, Some returns, Reserve grows native
+//   buffers and retries the exact request once.
 constexpr int kFrameSize = 192;
 constexpr uint32_t kMsgBits = 0x13U | (0x15U << 8);  // = 0x1513
 constexpr uint32_t kMsgSendSize = 24 + 40;           // header + 5×8 args
 constexpr uint32_t kMsgRcvSize = 64;                 // reply cap
 constexpr uint32_t kMsgIdSentinel = 0x10000000;
-constexpr uint32_t kReplySizeMin = 24 + 8 + 8;  // 40 — see sidecar.cpp ReplyMsg
+constexpr uint32_t kReplySizeMin =
+    24 + sizeof(sidecar::TranslationReply);  // 56 — plus 8-byte trailer fits 64
 
 // ──── Patch positions returned by every IPC-body emitter ─────────────────
 // Only abs-jump placeholders that depend on addresses outside the IPC body
@@ -566,6 +570,9 @@ struct IpcPatches {
     size_t kr_thunk_jump;    // kr abort thunk → abort_routine
     size_t size_thunk_jump;  // size abort thunk → abort_routine
     size_t id_thunk_jump;    // id abort thunk → abort_routine
+    size_t protocol_thunk_jump;
+    size_t fatal_thunk_jump;
+    size_t reserve_branch;
 };
 
 // Common prologue used by both IPC bodies: stash caller-saved x0..x5,
@@ -609,10 +616,10 @@ void emit_body_stores(std::vector<uint8_t>& ipc) {
 // Pre-conditions (set by the trap-specific code preceding this):
 //   x0 = kr (kern_return_t — zero-extended into x0 by mach_msg{,2}_trap)
 // Reply lives at sp+64..sp+128.  msgh_size at sp+68, msgh_id at sp+84,
-// result at sp+88, some_flag at sp+96.  Expected msgh_id stashed at
+// result at sp+88, kind at sp+96.  Expected msgh_id stashed at
 // sp+128 by emit_build_msgh_id() pre-svc.
 //
-// Every non-success path ends in a loud abort + write to fd 2 — we do
+// Every malformed-reply path ends in a loud abort + write to fd 1 — we do
 // NOT silently fall through on a bad reply: doing so previously masked
 // the multi-threaded reply-port cross-talk that froze WoW on world-load.
 IpcPatches emit_ipc_postlude(std::vector<uint8_t>& ipc) {
@@ -622,7 +629,7 @@ IpcPatches emit_ipc_postlude(std::vector<uint8_t>& ipc) {
     //
     // Three checkpoints, in order:
     //   1. kr != KERN_SUCCESS         (mach_msg failed)
-    //   2. msgh_size < kReplySizeMin  (reply too small for Some/None)
+    //   2. msgh_size < kReplySizeMin  (reply too small for the protocol)
     //   3. msgh_id  != expected       (cross-talk — Step 1b transaction id)
 
     // Checkpoint 1: kr != 0 → abort kind=0.  Uses cbnz_w (32-bit) since
@@ -630,7 +637,7 @@ IpcPatches emit_ipc_postlude(std::vector<uint8_t>& ipc) {
     const size_t krCbnzPos = ipc.size();
     emit(ipc, cbnz_w(0, 0));  // patched after thunks emitted
 
-    // Checkpoint 2: msgh_size < kReplySizeMin (40) → abort kind=1.
+    // Checkpoint 2: msgh_size < kReplySizeMin → abort kind=1.
     emit(ipc, ldr_w_offset(10, SP, 68));  // w10 = msgh_size
     emit(ipc, cmp_imm_w(10, kReplySizeMin));
     const size_t sizeBltPos = ipc.size();
@@ -643,13 +650,31 @@ IpcPatches emit_ipc_postlude(std::vector<uint8_t>& ipc) {
     const size_t idBnePos = ipc.size();
     emit(ipc, b_cond(COND_NE, 0));  // patched after thunks emitted
 
-    // Dispatch on some_flag at sp+96.  0 = None (fall through to STASH),
-    // 1 = Some.  CBZ skips 7 SOME-path instructions to land on NONE.
-    emit(ipc, ldr_w_offset(9, SP, 96));
-    emit(ipc, cbz_w(9, 8));
+    // Replies are None, Some, one Reserve, or an explicit translation failure. A
+    // malformed kind must not masquerade as a successful translation.
+    emit(ipc, ldr_x_offset(9, SP, 96));
+    emit(ipc, cmp_imm_x(9, static_cast<uint64_t>(sidecar::ReplyKind::Reserve)));
+    p.reserve_branch = ipc.size();
+    emit(ipc, b_cond(COND_EQ, 0));
+    emit(ipc, cmp_imm_x(9, static_cast<uint64_t>(sidecar::ReplyKind::Fatal)));
+    const size_t fatalBranch = ipc.size();
+    emit(ipc, b_cond(COND_EQ, 0));
+    const size_t badKind = ipc.size();
+    emit(ipc, b_cond(COND_HI, 0));
+    const size_t noneBranch = ipc.size();
+    emit(ipc, cbz(9, 0));
 
     // ── SOME PATH ───────────────────────────────────────────────────────
-    emit(ipc, ldr_x_offset(0, SP, 88));      // x0 = result
+    emit(ipc, ldr_x_offset(9, SP, 88));
+    emit(ipc, ldr_x_offset(10, SP, 32));
+    emit(ipc, cmp_reg_x(9, 10));
+    const size_t noProgress = ipc.size();
+    emit(ipc, b_cond(COND_LS, 0));
+    emit(ipc, ldr_x_offset(10, SP, 24));
+    emit(ipc, cmp_reg_x(9, 10));
+    const size_t pastBlock = ipc.size();
+    emit(ipc, b_cond(COND_HI, 0));
+    emit(ipc, mov_reg_x(0, 9));              // x0 = validated next instruction
     emit(ipc, ldr_x_offset(1, SP, 8));       // restore x1
     emit(ipc, ldp_offset(2, 3, SP, 16));     // restore x2, x3
     emit(ipc, ldp_offset(4, 5, SP, 32));     // restore x4, x5
@@ -658,6 +683,7 @@ IpcPatches emit_ipc_postlude(std::vector<uint8_t>& ipc) {
     emit(ipc, RET_INSN);                     // ret
 
     // ── NONE PATH ───────────────────────────────────────────────────────
+    patch_word(ipc, noneBranch, cbz(9, static_cast<int32_t>((ipc.size() - noneBranch) / 4)));
     // Restore caller regs and abs-jump to STASH.  x0 comes from sp+0 —
     // the SOME path read from sp+88 (reply body), but for NONE we hand
     // stock the caller's untouched args.
@@ -694,6 +720,26 @@ IpcPatches emit_ipc_postlude(std::vector<uint8_t>& ipc) {
     emit(ipc, movz(1, 2, 0));
     emit(ipc, ldr_x_offset(2, SP, 32));
     p.id_thunk_jump = emit_abs_jump_placeholder(ipc);
+
+    const size_t protocolThunkPos = ipc.size();
+    emit(ipc, mov_reg_x(0, 9));
+    emit(ipc, movz(1, 3, 0));
+    emit(ipc, ldr_x_offset(2, SP, 32));
+    p.protocol_thunk_jump = emit_abs_jump_placeholder(ipc);
+    patch_word(ipc, badKind,
+               b_cond(COND_HI, static_cast<int32_t>((protocolThunkPos - badKind) / 4)));
+    patch_word(ipc, noProgress,
+               b_cond(COND_LS, static_cast<int32_t>((protocolThunkPos - noProgress) / 4)));
+    patch_word(ipc, pastBlock,
+               b_cond(COND_HI, static_cast<int32_t>((protocolThunkPos - pastBlock) / 4)));
+
+    const size_t fatalThunkPos = ipc.size();
+    emit(ipc, ldr_x_offset(0, SP, 88));
+    emit(ipc, movz(1, 4, 0));  // no correct stock fallback exists
+    emit(ipc, ldr_x_offset(2, SP, 32));
+    p.fatal_thunk_jump = emit_abs_jump_placeholder(ipc);
+    patch_word(ipc, fatalBranch,
+               b_cond(COND_EQ, static_cast<int32_t>((fatalThunkPos - fatalBranch) / 4)));
 
     // Patch the three checkpoint forward branches to land on their
     // thunks now that we know each thunk's offset.
@@ -810,9 +856,168 @@ void emit_mach_msg2_call(std::vector<uint8_t>& ipc, uint32_t sidecarReqName,
 constexpr uint32_t kMachRcvInterrupted = 0x10004005U;
 constexpr uint32_t kMachSendInterrupted = 0x10000007U;
 
+// Called with the IPC frame live. Capacities occupy the reply slots and remain
+// intact across native calls. All validation precedes allocation; no generated
+// instruction or fixup length is published by this reservation step.
+void emit_reserve_buffers(std::vector<uint8_t>& ipc, NativeAllocators allocators, size_t badReply) {
+    const auto reject = [&](uint32_t condition) {
+        emit(ipc, b_cond(condition, static_cast<int32_t>((badReply - ipc.size()) / 4)));
+    };
+    emit(ipc, ldr_w_offset(9, SP, 132));
+    emit(ipc, cmp_imm_w(9, 0));
+    reject(COND_NE);  // at most one reserve/retry per original request
+    emit(ipc, movz(9, 1, 0));
+    emit(ipc, str_w_offset(9, SP, 132));
+    emit(ipc, movz(14, 0, 0));
+    constexpr uint32_t capacities[] = {88, 104, 112};
+    constexpr uint32_t divisors[] = {4, sizeof(Fixup), sizeof(Fixup)};
+    for (size_t i = 0; i < 3; ++i) {
+        emit(ipc, ldr_x_offset(9, SP, capacities[i]));
+        emit_load_imm64(ipc, 10, sidecar::kMaxReserveBytes);
+        emit(ipc, cmp_reg_x(9, 10));
+        reject(COND_HI);
+        emit(ipc, movz(10, divisors[i], 0));
+        emit(ipc, 0x9AC00800U | (10U << 16) | (9U << 5) | 11U);  // udiv x11,x9,x10
+        emit(ipc, 0x9B008000U | (10U << 16) | (9U << 10) | (11U << 5) | 11U);
+        // msub x11,x11,x10,x9: remainder must be zero.
+        emit(ipc, cmp_imm_x(11, 0));
+        reject(COND_NE);
+        emit(ipc, 0xAA000000U | (9U << 16) | (14U << 5) | 14U);  // orr x14,x14,x9
+    }
+    emit(ipc, cmp_imm_x(14, 0));
+    reject(COND_EQ);
+    // Validate all old metadata before the first native allocation. The copy
+    // loop advances by a word, so an unaligned live length cannot be accepted.
+    const auto multipleOf = [&](uint32_t value, uint32_t divisor) {
+        emit(ipc, movz(13, divisor, 0));
+        emit(ipc, 0x9AC00800U | (13U << 16) | (value << 5) | 14U);
+        emit(ipc, 0x9B008000U | (13U << 16) | (value << 10) | (14U << 5) | 15U);
+        emit(ipc, cmp_imm_x(15, 0));
+        reject(COND_NE);  // x14 retains the quotient
+    };
+    constexpr uint32_t bufferOffsets[] = {offsetof(TranslationResult, insn_buf),
+                                          offsetof(TranslationResult, external_fixups),
+                                          offsetof(TranslationResult, _fixups)};
+    for (size_t i = 0; i < 3; ++i) {
+        emit(ipc, ldr_x_offset(9, SP, capacities[i]));
+        const size_t skipValidation = ipc.size();
+        emit(ipc, cbz(9, 0));
+        emit(ipc, ldr_x_offset(8, SP, 0));
+        emit(ipc, add_imm(8, 8, bufferOffsets[i]));
+        emit(ipc, ldp_offset(10, 11, 8, 8));  // end and capacity
+        emit(ipc, ldr_x_offset(12, 8, 0));    // data / begin
+        emit(ipc, cmp_reg_x(10, 11));
+        reject(COND_HI);
+        multipleOf(12, alignof(uint32_t));
+        emit(ipc, cmp_imm_x(12, 0));
+        emit(ipc, b_cond(COND_NE, 3));
+        emit(ipc, cmp_imm_x(11, 0));
+        reject(COND_NE);  // a null pointer cannot describe allocated storage
+        if (i != 0) {
+            emit(ipc, cmp_reg_x(12, 10));
+            reject(COND_HI);
+            emit(ipc, sub_reg_x(10, 10, 12));
+            emit(ipc, sub_reg_x(11, 11, 12));
+            multipleOf(10, sizeof(Fixup));
+            emit(ipc, ldr_x_offset(15, 8, 24));
+            emit(ipc, cmp_reg_x(15, 14));
+            reject(COND_HI);  // committed count cannot exceed live records
+            multipleOf(11, sizeof(Fixup));
+        } else {
+            multipleOf(10, sizeof(uint32_t));
+            multipleOf(11, sizeof(uint32_t));
+            emit(ipc, 0xAB000000U | (11U << 16) | (12U << 5) | 13U);
+            reject(COND_HS);  // adds x13,x12,x11: the address range cannot wrap
+            emit(ipc, ldr_w_offset(12, 8, offsetof(AssemblerBuffer, use_heap)));
+            emit(ipc, cmp_imm_w(12, 1));
+            reject(COND_HI);
+            // Predict every native doubling before any buffer is changed.
+            emit(ipc, mov_reg_x(13, 11));
+            emit(ipc, cmp_imm_x(13, 0));
+            emit(ipc, b_cond(COND_NE, 2));
+            emit(ipc, movz(13, 0x4000, 0));
+            const size_t sizingLoop = ipc.size();
+            emit(ipc, cmp_reg_x(13, 9));
+            const size_t sized = ipc.size();
+            emit(ipc, b_cond(COND_HS, 0));
+            emit_load_imm64(ipc, 14, sidecar::kMaxReserveBytes / 2);
+            emit(ipc, cmp_reg_x(13, 14));
+            reject(COND_HI);
+            emit(ipc, lsl_imm_x(13, 13, 1));
+            emit(ipc, b_uncond(static_cast<int32_t>((sizingLoop - ipc.size()) / 4)));
+            patch_word(ipc, sized, b_cond(COND_HS, static_cast<int32_t>((ipc.size() - sized) / 4)));
+        }
+        emit(ipc, cmp_reg_x(9, 11));
+        reject(COND_LS);  // a reservation must enlarge the existing capacity
+        patch_word(ipc, skipValidation,
+                   cbz(9, static_cast<int32_t>((ipc.size() - skipValidation) / 4)));
+    }
+
+    emit(ipc, ldr_x_offset(9, SP, 88));
+    const size_t noInstructions = ipc.size();
+    emit(ipc, cbz(9, 0));
+    const size_t growLoop = ipc.size();
+    emit(ipc, ldr_x_offset(0, SP, 0));
+    emit(ipc, add_imm(0, 0, offsetof(TranslationResult, insn_buf)));
+    emit(ipc, ldr_x_offset(10, 0, offsetof(AssemblerBuffer, end_cap)));
+    emit(ipc, ldr_x_offset(9, SP, 88));
+    emit(ipc, cmp_reg_x(10, 9));
+    const size_t enoughInstructions = ipc.size();
+    emit(ipc, b_cond(COND_HS, 0));
+    // The validated native function doubles capacity (or starts at 16 KiB).
+    // This bound makes both allocated bytes and iteration count finite.
+    emit_load_imm64(ipc, 11, sidecar::kMaxReserveBytes / 2);
+    emit(ipc, cmp_reg_x(10, 11));
+    reject(COND_HI);
+    emit_load_imm64(ipc, 16, allocators.grow);
+    emit(ipc, 0xD63F0200U);  // blr x16
+    emit(ipc, b_uncond(static_cast<int32_t>((growLoop - ipc.size()) / 4)));
+    patch_word(ipc, noInstructions,
+               cbz(9, static_cast<int32_t>((ipc.size() - noInstructions) / 4)));
+    patch_word(ipc, enoughInstructions,
+               b_cond(COND_HS, static_cast<int32_t>((ipc.size() - enoughInstructions) / 4)));
+
+    constexpr uint32_t listOffsets[] = {offsetof(TranslationResult, external_fixups),
+                                        offsetof(TranslationResult, _fixups)};
+    for (size_t i = 0; i < 2; ++i) {
+        emit(ipc, ldr_x_offset(1, SP, capacities[i + 1]));
+        const size_t skip = ipc.size();
+        emit(ipc, cbz(1, 0));
+        emit_load_imm64(ipc, 0, allocators.arena_pointer);
+        emit(ipc, ldr_x_offset(0, 0, 0));
+        emit_load_imm64(ipc, 16, allocators.arena_allocate);
+        emit(ipc, 0xD63F0200U);  // blr x16: x0 = arena-owned replacement
+        emit(ipc, ldr_x_offset(8, SP, 0));
+        emit(ipc, add_imm(8, 8, listOffsets[i]));
+        emit(ipc, ldp_offset(9, 10, 8, 0));  // old begin, old end
+        emit(ipc, mov_reg_x(12, 0));
+        emit(ipc, cmp_reg_x(9, 10));
+        const size_t empty = ipc.size();
+        emit(ipc, b_cond(COND_EQ, 0));
+        const size_t copyLoop = ipc.size();
+        // Fixups are 12-byte records with 4-byte alignment. Copy only live
+        // bytes; the old allocation remains owned by the native arena.
+        emit(ipc, ldr_w_offset(13, 9, 0));
+        emit(ipc, str_w_offset(13, 12, 0));
+        emit(ipc, add_imm(9, 9, 4));
+        emit(ipc, add_imm(12, 12, 4));
+        emit(ipc, cmp_reg_x(9, 10));
+        emit(ipc, b_cond(COND_NE, static_cast<int32_t>((copyLoop - ipc.size()) / 4)));
+        patch_word(ipc, empty, b_cond(COND_EQ, static_cast<int32_t>((ipc.size() - empty) / 4)));
+        emit(ipc, ldr_x_offset(11, SP, capacities[i + 1]));
+        emit(ipc, add_reg_x(11, 0, 11));
+        emit(ipc, stp_offset(0, 12, 8, 0));
+        emit(ipc, str_x_offset(11, 8, 16));
+        // The committed element count at +24 is preserved verbatim.
+        patch_word(ipc, skip, cbz(1, static_cast<int32_t>((ipc.size() - skip) / 4)));
+    }
+}
+
 IpcPatches emit_mach_msg2_ipc(std::vector<uint8_t>& ipc, uint32_t sidecarReqName,
-                              uint32_t parentReplyName) {
+                              uint32_t parentReplyName, NativeAllocators allocators) {
     emit_ipc_prologue(ipc);
+    emit(ipc, str_w_offset(31, SP, 132));  // no reserve yet
+    const size_t requestPos = ipc.size();
 
     // Body: five translate_insn args (still in x0..x4).
     emit_body_stores(ipc);
@@ -880,6 +1085,17 @@ IpcPatches emit_mach_msg2_ipc(std::vector<uint8_t>& ipc, uint32_t sidecarReqName
     patch_word(ipc, bRetryFullPos,
                b_cond(COND_EQ, static_cast<int32_t>((retryFullPos - bRetryFullPos) / 4)));
 
+    const size_t reservePos = ipc.size();
+    patch_word(ipc, p.reserve_branch,
+               b_cond(COND_EQ, static_cast<int32_t>((reservePos - p.reserve_branch) / 4)));
+    emit_reserve_buffers(ipc, allocators, p.protocol_thunk_jump - 12);
+    // Native calls can clobber every caller-saved argument. Restore the exact
+    // request before rebuilding its message; the stack frame is reused.
+    emit(ipc, ldp_offset(0, 1, SP, 0));
+    emit(ipc, ldp_offset(2, 3, SP, 16));
+    emit(ipc, ldr_x_offset(4, SP, 32));
+    emit(ipc, b_uncond(static_cast<int32_t>((requestPos - ipc.size()) / 4)));
+
     return p;
 }
 
@@ -888,7 +1104,7 @@ IpcPatches emit_mach_msg2_ipc(std::vector<uint8_t>& ipc, uint32_t sidecarReqName
 // ──── public ────────────────────────────────────────────────────────────────
 
 StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t origPrologue16[16],
-                uint32_t sidecarReqName, uint32_t parentReplyName) {
+                uint32_t sidecarReqName, uint32_t parentReplyName, NativeAllocators allocators) {
     StubBlobs blobs;
 
     // ENTRY: 16-byte abs-jump to handlerAddr, written into translate_insn[0..16].
@@ -898,7 +1114,9 @@ StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t 
     // Sanity: the 3-mov+br encoding only works if the target's top 16 bits
     // are zero.  macOS userland addresses are always sub-256TB, so this
     // holds.  Caller sees entry shorter than 16 → failure signal.
-    if (handlerAddr & 0xFFFF000000000000ULL) {
+    if ((handlerAddr | allocators.grow | allocators.arena_allocate | allocators.arena_pointer) &
+            0xFFFF000000000000ULL ||
+        allocators.grow == 0 || allocators.arena_allocate == 0 || allocators.arena_pointer == 0) {
         blobs.entry.clear();
         return blobs;
     }
@@ -913,7 +1131,7 @@ StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t 
     constexpr size_t kFilterBytes = kFilterInstrs * 4;
 
     std::vector<uint8_t> ipc;
-    const IpcPatches patches = emit_mach_msg2_ipc(ipc, sidecarReqName, parentReplyName);
+    const IpcPatches patches = emit_mach_msg2_ipc(ipc, sidecarReqName, parentReplyName, allocators);
 
     // ── Resolve final addresses and patch placeholders ──────────────────────
     // STASH starts at handlerAddr + kFilterBytes + ipc.size_final;
@@ -928,6 +1146,8 @@ StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t 
     patch_abs_jump_3movs(ipc, patches.kr_thunk_jump, abortRoutineAddr);
     patch_abs_jump_3movs(ipc, patches.size_thunk_jump, abortRoutineAddr);
     patch_abs_jump_3movs(ipc, patches.id_thunk_jump, abortRoutineAddr);
+    patch_abs_jump_3movs(ipc, patches.protocol_thunk_jump, abortRoutineAddr);
+    patch_abs_jump_3movs(ipc, patches.fatal_thunk_jump, abortRoutineAddr);
 
     // ──── FILTER prologue ───────────────────────────────────────────────────
     // Bypass the IPC entirely for non-x87 opcodes — translate_insn fires for
@@ -1073,8 +1293,8 @@ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
     constexpr uint32_t kOffLr = 32;      // return address of the real caller
     constexpr uint32_t kOffCodeBase = 40;
     constexpr uint32_t kOffCodeEnd = 48;
-    constexpr uint32_t kOffInsn = 56;   // guest address of the instruction
-    constexpr uint32_t kOffSubst = 64;  // 16 B: the substitute instruction
+    constexpr uint32_t kOffInsn = 56;      // guest address of the instruction
+    constexpr uint32_t kOffSubst = 64;     // 16 B: the substitute instruction
     constexpr uint32_t kOffMnemonic = 80;  // mnemonic to force, 0 for none
     constexpr uint32_t kFrame = 96;
 
@@ -1225,7 +1445,7 @@ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
     // 56: str x15, [x12, #8]          ; ctx->code_base = the substitute buffer
     emit(h, str_x_offset(15, 12, kDecoderCtxCodeBase));
     // 57: add x9, x15, x14            ; only the bytes we actually copied are
-    emit(h, add_reg_x(9, 15, 14));     //   readable, matching the real bound
+    emit(h, add_reg_x(9, 15, 14));  //   readable, matching the real bound
     // 58: str x9, [x12, #16]          ; ctx->code_end
     emit(h, str_x_offset(9, 12, kDecoderCtxCodeEnd));
     // 59: ldr x0, [sp, #0]            ; ctx

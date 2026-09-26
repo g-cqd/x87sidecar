@@ -1,5 +1,7 @@
 #include "offset_finder.hpp"
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -321,6 +323,11 @@ __text:00000000000147B4 08 F1 4F 39                 LDRB            W8, [X8,#dis
     // string's reference, then the last `adrp xM; add xM, xM, #lo` before it
     // that does not build the string itself: that is the root. Best effort.
     const Range text = sectionRange(runtime, "__TEXT", "__text");
+    allocatorCallerCodeChecks_ = discoverAllocatorCaller(buffer, text.begin, text.end);
+    if (allocatorCallerCodeChecks_.empty()) {
+        std::fprintf(stdout, "runtime allocation caller lock contract is unsupported\n");
+        return false;
+    }
     const Range cstrings = sectionRange(runtime, "__TEXT", "__cstring");
     if (const std::uint64_t panic =
             findCString(buffer, cstrings, "cannot locate code fragment for arm address")) {
@@ -504,6 +511,16 @@ auto OffsetFinder::determineRuntimeOffsets() -> bool {
         std::memcpy(decodeOpcodePrologue_.data(), image.data() + offsetDecodeOpcode_, 16);
     }
 
+    if (const auto* data = libRosettaRuntimeLoader.getSection("__DATA", "__bss");
+        data != nullptr && data->size <= UINT64_MAX - data->addr) {
+        auto allocator = discoverRuntimeAllocator(image, text.begin, text.end, data->addr,
+                                                  data->addr + data->size);
+        offsetAssemblerBufferGrow_ = allocator.grow;
+        offsetArenaAllocate_ = allocator.arenaAllocate;
+        offsetArenaPointer_ = allocator.arenaPointer;
+        allocatorCodeChecks_ = std::move(allocator.codeChecks);
+    }
+
     // The opcode mnemonic table, in host enum order: what the runtime's own
     // module printer uses. Read it whole; the loader checks the entries the
     // stub filter's opcode ranges depend on against it.
@@ -525,4 +542,247 @@ auto OffsetFinder::determineRuntimeOffsets() -> bool {
     }
 
     return true;
+}
+
+namespace {
+
+// The audited bodies fix the buffer ABI, arena ownership, and fatal allocation
+// failure contract. Only address-bearing immediates may vary across builds.
+constexpr std::array<std::uint32_t, 20> kAllocatorEmit = {
+    0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xaa0103f4, 0xaa0003f3, 0xa940a408, 0x9100110a,
+    0xeb09015f, 0x54000083, 0xaa1303e0, 0x940005fb, 0xf9400668, 0xf9400269, 0xb8286934,
+    0xf9400668, 0x91001108, 0xf9000668, 0xa9417bfd, 0xa8c24ff4, 0xd65f03c0,
+};
+constexpr std::array<std::uint32_t, 37> kAllocatorGrow = {
+    0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd, 0xaa0003f3, 0x52880008, 0xf9400809, 0xd37ff92a,
+    0xf100013f, 0x9a8a0114, 0xb9401808, 0x340000c8, 0xf0000328, 0xf946fd00, 0xaa1403e1, 0x94012575,
+    0x14000004, 0xaa1403e0, 0x52801cc1, 0x94012599, 0xaa0003f5, 0xf9400261, 0xb4000121, 0xf9400a62,
+    0xaa1503e0, 0x97fff616, 0xb9401a68, 0x35000088, 0xf9400260, 0xf9400a61, 0x97fff7c0, 0xf9000275,
+    0xf9000a74, 0xa9427bfd, 0xa9414ff4, 0xa8c357f6, 0xd65f03c0,
+};
+constexpr std::array<std::uint32_t, 40> kAllocatorArena = {
+    0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd, 0x91003c28, 0xf27ced08, 0x54000380, 0xaa0003f3,
+    0xf9400009, 0xb4000169, 0xf9400d2a, 0xab08014b, 0x54000362, 0xf940092c, 0xeb0c017f, 0x540000a2,
+    0x8b0a0120, 0x8b080148, 0xf9000d28, 0x14000010, 0x91008115, 0x52a00408, 0xf14802bf, 0x9a8882b4,
+    0xaa1403e0, 0x52801d81, 0x9400000e, 0xaa0003e8, 0x91008000, 0xf9400269, 0xa900d109, 0xf9000268,
+    0xf9000d15, 0x14000002, 0xd2800000, 0xa9427bfd, 0xa9414ff4, 0xa8c357f6, 0xd65f03c0, 0xd4200020,
+};
+constexpr std::array<std::uint32_t, 22> kAllocatorMap = {
+    0xd100c3ff, 0xa9014ff4, 0xa9027bfd, 0x910083fd, 0xaa0003f3, 0x53081c24, 0xd2c00020, 0xaa1303e1,
+    0x52800062, 0x52820043, 0xd2800005, 0x97fed25d, 0xb100041f, 0x540000a0, 0xa9427bfd, 0xa9414ff4,
+    0x9100c3ff, 0xd65f03c0, 0xf90003f3, 0xf00000a0, 0x91072400, 0x94000971,
+};
+constexpr std::array<std::uint32_t, 17> kAllocatorFatal = {
+    0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xd11043ff, 0xaa0003e2, 0x910043a8,
+    0xf90007e8, 0x910043f3, 0x910043e0, 0x910043a3, 0x52808001, 0x97fffd78,
+    0xf90003f3, 0xb00000a0, 0x91068800, 0x97ffffca, 0xd4200020,
+};
+constexpr std::array<std::uint32_t, 5> kAllocatorCopy = {
+    0xa9bf7bfd, 0x910003fd, 0xcb010003, 0xeb02007f, 0x54000a43,
+};
+constexpr std::array<std::uint32_t, 5> kAllocatorUnmapCall = {
+    0xd2800930, 0xd4001001, 0x92800001, 0x9a802020, 0xd65f03c0,
+};
+constexpr std::array<std::uint32_t, 5> kAllocatorMapCall = {
+    0xd28018b0, 0xd4001001, 0x92800001, 0x9a802020, 0xd65f03c0,
+};
+
+struct MaskedWord {
+    size_t index;
+    std::uint32_t mask;
+};
+
+// Every read is within the executable section and the file. PC-relative calls
+// are decoded and checked separately before any discovered address is returned.
+template <size_t N>
+bool allocationShape(const Image& image, Range text, std::uint64_t offset,
+                     const std::array<std::uint32_t, N>& words,
+                     std::initializer_list<MaskedWord> variable = {}) {
+    if (offset < text.begin || offset > text.end || N * 4 > text.end - offset) {
+        return false;
+    }
+    for (size_t i = 0; i < N; ++i) {
+        std::uint32_t mask = UINT32_MAX;
+        for (const auto& change : variable) {
+            if (change.index == i) {
+                mask = change.mask;
+            }
+        }
+        if ((insnAt(image, offset + i * 4) & mask) != (words[i] & mask)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+auto discoverRuntimeAllocator(const std::vector<std::uint8_t>& image, std::uint64_t textBegin,
+                              std::uint64_t textEnd, std::uint64_t dataBegin, std::uint64_t dataEnd)
+    -> RuntimeAllocatorDiscovery {
+    if (textBegin % 4 != 0 || textEnd % 4 != 0 || textBegin >= textEnd || textEnd > image.size() ||
+        dataBegin >= dataEnd) {
+        return {};
+    }
+    const Range text{textBegin, textEnd};
+    constexpr std::uint32_t kCall = 0xfc000000;
+    constexpr std::uint32_t kPage = 0x9f00001f;
+    constexpr std::uint32_t kOffset = 0xffc003ff;
+    RuntimeAllocatorDiscovery result;
+    for (std::uint64_t emit = textBegin; textEnd - emit >= kAllocatorEmit.size() * 4; emit += 4) {
+        if (!allocationShape(image, text, emit, kAllocatorEmit, {{10, kCall}})) {
+            continue;
+        }
+        const auto call = [&](std::uint64_t at) { return blTarget(insnAt(image, at), at); };
+        const std::uint64_t grow = call(emit + 0x28);
+        if (!allocationShape(
+                image, text, grow, kAllocatorGrow,
+                {{12, kPage}, {13, kOffset}, {15, kCall}, {19, kCall}, {25, kCall}, {30, kCall}})) {
+            continue;
+        }
+        const std::uint64_t arena = call(grow + 0x3c);
+        const std::uint64_t map = call(grow + 0x4c);
+        const std::uint64_t copy = call(grow + 0x64);
+        const std::uint64_t unmap = call(grow + 0x78);
+        if (!allocationShape(image, text, arena, kAllocatorArena, {{26, kCall}}) ||
+            !allocationShape(image, text, map, kAllocatorMap,
+                             {{11, kCall}, {19, kPage}, {20, kOffset}, {21, kCall}}) ||
+            !allocationShape(image, text, copy, kAllocatorCopy) ||
+            !allocationShape(image, text, unmap, kAllocatorUnmapCall) ||
+            call(arena + 0x68) != map) {
+            continue;
+        }
+        const std::uint64_t mapCall = call(map + 0x2c);
+        const std::uint64_t fatal = call(map + 0x54);
+        if (!allocationShape(image, text, mapCall, kAllocatorMapCall) ||
+            !allocationShape(image, text, fatal, kAllocatorFatal,
+                             {{11, kCall}, {13, kPage}, {14, kOffset}, {15, kCall}})) {
+            continue;
+        }
+        // The fatal path ends in BRK, with no C++ exception-unwind path. Its two
+        // diagnostic calls must still name code within this runtime image.
+        const auto validCall = [&](std::uint64_t at) {
+            const auto target = call(at);
+            return target >= textBegin && target < textEnd;
+        };
+        if (!validCall(fatal + 0x2c) || !validCall(fatal + 0x3c)) {
+            continue;
+        }
+        const auto load = insnAt(image, grow + 0x34);
+        const auto page = adrpTarget(insnAt(image, grow + 0x30), grow + 0x30);
+        const auto low = static_cast<std::uint64_t>((load >> 10) & 0xfff) * 8;
+        if (page > UINT64_MAX - low) {
+            continue;
+        }
+        const auto pointer = page + low;
+        if (pointer % 8 != 0 || pointer < dataBegin || pointer > dataEnd ||
+            dataEnd - pointer < sizeof(std::uint64_t)) {
+            continue;
+        }
+        if (result.grow != 0) {
+            return {};  // A second complete candidate makes the ABI ambiguous.
+        }
+        result.grow = grow;
+        result.arenaAllocate = arena;
+        result.arenaPointer = pointer;
+        const auto snapshot = [&](std::uint64_t offset, size_t count) {
+            result.codeChecks.push_back(
+                {offset, {image.begin() + offset, image.begin() + offset + count * 4}});
+        };
+        snapshot(emit, kAllocatorEmit.size());
+        snapshot(grow, kAllocatorGrow.size());
+        snapshot(arena, kAllocatorArena.size());
+        snapshot(map, kAllocatorMap.size());
+        snapshot(fatal, kAllocatorFatal.size());
+        snapshot(copy, kAllocatorCopy.size());
+        snapshot(unmap, kAllocatorUnmapCall.size());
+        snapshot(mapCall, kAllocatorMapCall.size());
+    }
+    return result;
+}
+
+auto discoverAllocatorCaller(const std::vector<std::uint8_t>& image, std::uint64_t textBegin,
+                             std::uint64_t textEnd) -> std::vector<RuntimeCodeCheck> {
+    if (textBegin % 4 != 0 || textEnd % 4 != 0 || textBegin >= textEnd || textEnd > image.size()) {
+        return {};
+    }
+    // These whole-body fingerprints pin the audited external-lock contract.
+    // A changed runtime needs a new control-flow audit, not a relaxed match.
+    constexpr std::array<std::uint8_t, CC_SHA256_DIGEST_LENGTH> kCallerDigest = {
+        0xb5, 0x5f, 0x41, 0x55, 0xdb, 0x75, 0x13, 0xff, 0x03, 0x8b, 0x39,
+        0xc2, 0xa4, 0x4d, 0xff, 0x1b, 0x2f, 0x66, 0xa8, 0x08, 0x05, 0xe4,
+        0x74, 0xdb, 0x42, 0xa7, 0x0b, 0x60, 0xa0, 0x84, 0x7d, 0x38,
+    };
+    constexpr std::array<std::uint8_t, CC_SHA256_DIGEST_LENGTH> kLocksDigest = {
+        0x39, 0x43, 0x15, 0x36, 0xc2, 0x9b, 0xc4, 0x2a, 0x27, 0xd9, 0x8d,
+        0xd2, 0xd0, 0xcd, 0x57, 0xc3, 0x1c, 0x53, 0xaa, 0x1e, 0x9e, 0x75,
+        0x49, 0x68, 0xd6, 0x6e, 0x0f, 0x4b, 0x71, 0x0a, 0xc5, 0x85,
+    };
+    constexpr std::array<std::uint8_t, CC_SHA256_DIGEST_LENGTH> kThunkDigest = {
+        0x4b, 0xbb, 0x49, 0x53, 0x27, 0xf2, 0xf4, 0x2e, 0xdd, 0x73, 0x40,
+        0xef, 0xda, 0xf0, 0x91, 0x1f, 0xb9, 0x65, 0xc9, 0x5f, 0x95, 0xa0,
+        0x3e, 0x1d, 0x89, 0xd1, 0xbf, 0xce, 0xd6, 0x17, 0x76, 0xba,
+    };
+    constexpr std::array<std::uint32_t, 9> kCallerStart = {0xa9ba6ffc, 0xa90167fa, 0xa9025ff8,
+                                                           0xa90357f6, 0xa9044ff4, 0xa9057bfd,
+                                                           0x910143fd, 0xd10883ff, 0xf90013e4};
+    constexpr size_t kCallerBytes = 0xfdc;
+    constexpr size_t kLockBytes = 0x140;
+    constexpr size_t kThunkBytes = 16;
+    const Range text{textBegin, textEnd};
+    const auto fingerprint = [&](std::uint64_t offset, size_t length, const auto& expected) {
+        if (offset < textBegin || offset > textEnd || length > textEnd - offset) {
+            return false;
+        }
+        std::array<std::uint8_t, CC_SHA256_DIGEST_LENGTH> digest{};
+        CC_SHA256(image.data() + offset, static_cast<CC_LONG>(length), digest.data());
+        return digest == expected;
+    };
+    for (std::uint64_t caller = textBegin; textEnd - caller >= kCallerBytes; caller += 4) {
+        if (!allocationShape(image, text, caller, kCallerStart) ||
+            !fingerprint(caller, kCallerBytes, kCallerDigest)) {
+            continue;
+        }
+        const auto call = [&](std::uint64_t at) { return blTarget(insnAt(image, at), at); };
+        const auto lock = call(caller + 0x60);
+        const auto thunk = call(caller + 0x40c);
+        if (!fingerprint(lock, kLockBytes, kLocksDigest) ||
+            !fingerprint(thunk, kThunkBytes, kThunkDigest) || call(caller + 0x6c) != lock ||
+            call(caller + 0xfa8) != lock + 0xc4 || call(caller + 0xfb4) != lock + 0xc4) {
+            return {};
+        }
+        // Bind the verified thunk to the named import, rather than infer its
+        // identity from its location in the runtime's function-pointer table.
+        const auto page = adrpTarget(insnAt(image, thunk), thunk);
+        const auto low = ((insnAt(image, thunk + 4) >> 10) & 0xfff) +
+                         ((insnAt(image, thunk + 8) >> 10) & 0xfff) * 8;
+        if (page > UINT64_MAX - low) {
+            return {};
+        }
+        const auto slot = page + low;
+        if (slot > image.size() || image.size() - slot < 16) {
+            return {};
+        }
+        std::uint64_t name = 0;
+        std::memcpy(&name, image.data() + slot + 8, sizeof(name));
+        name &= 0xffffffff;  // dyld_chained_ptr_64_rebase metadata lives above RVA32.
+        constexpr char kTranslateName[] =
+            "__ZN7rosetta7runtime7library20translator_translateEPKNS1_"
+            "12ModuleResultE15TranslationMode";
+        if (name > image.size() || sizeof(kTranslateName) > image.size() - name ||
+            std::memcmp(image.data() + name, kTranslateName, sizeof(kTranslateName)) != 0) {
+            return {};
+        }
+        size_t callers = 0;
+        for (std::uint64_t at = textBegin; at < textEnd; at += 4) {
+            callers += blTarget(insnAt(image, at), at) == thunk;
+        }
+        if (callers != 1) {
+            return {};  // Every stock call must share the audited lock context.
+        }
+        return {{caller, {image.begin() + caller, image.begin() + caller + kCallerBytes}},
+                {lock, {image.begin() + lock, image.begin() + lock + kLockBytes}},
+                {thunk, {image.begin() + thunk, image.begin() + thunk + kThunkBytes}}};
+    }
+    return {};
 }

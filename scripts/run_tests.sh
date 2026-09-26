@@ -302,7 +302,7 @@ check_output() {
 export X87_DISABLE_STOCK_COMPAT=1
 
 # Host-side boundary coverage runs even when only native Rosetta is available.
-for test in test_assembler_buffer test_sidecar_transaction; do
+for test in test_assembler_buffer test_sidecar_transaction test_runtime_allocator test_stub_reserve; do
     EXIT=0
     OUT=$("$BIN/$test" 2>&1) || EXIT=$?
     check_output "$test" "$OUT" "$EXIT"

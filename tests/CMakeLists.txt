@@ -9,6 +9,13 @@ add_executable(test_sidecar_transaction test_sidecar_transaction.cpp
     ../rosetta_loader/src/x87_trace.cpp)
 target_link_libraries(test_sidecar_transaction PRIVATE rosetta_core)
 
+add_executable(test_stub_reserve test_stub_reserve.cpp)
+target_link_libraries(test_stub_reserve PRIVATE rosetta_core)
+
+add_executable(test_runtime_allocator test_runtime_allocator.cpp
+    ../rosetta_loader/src/offset_finder.cpp
+    ../rosetta_loader/src/macho_loader.cpp)
+
 add_x86_sample(test_fldconst)
 add_x86_sample(test_detach_signals)
 add_x86_sample(test_fld)

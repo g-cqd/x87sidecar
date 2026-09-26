@@ -1663,8 +1663,35 @@ int main(int argc, char* argv[]) try {
         // ── Assemble stub bytes ─────────────────────────────────────────────
         // OUR_HANDLER + STASH + STASH_JUMP go to padStartAddr.
         // ENTRY (16-byte abs-jump to OUR_HANDLER) goes to translate_insn[0..16].
+        if (libBase == 0 || offsetFinder.offsetAssemblerBufferGrow_ == 0 ||
+            offsetFinder.offsetArenaAllocate_ == 0 || offsetFinder.offsetArenaPointer_ == 0 ||
+            offsetFinder.allocatorCodeChecks_.empty() ||
+            offsetFinder.allocatorCallerCodeChecks_.empty()) {
+            fprintf(stdout, "M2: native translation allocator is not verified; refusing to hook\n");
+            return 1;
+        }
+        const auto verifiedLiveCode = [&](uint64_t base, const auto& checks) {
+            for (const auto& check : checks) {
+                std::vector<uint8_t> live(check.bytes.size());
+                if (!dbg.readMemory(base + check.offset, live.data(), live.size()) ||
+                    live != check.bytes) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!verifiedLiveCode(libBase, offsetFinder.allocatorCodeChecks_) ||
+            !verifiedLiveCode(runtimeBase, offsetFinder.allocatorCallerCodeChecks_)) {
+            fprintf(stdout, "M2: native allocator or caller differs from verified runtime\n");
+            return 1;
+        }
+        const stub_asm::NativeAllocators allocators{
+            libBase + offsetFinder.offsetAssemblerBufferGrow_,
+            libBase + offsetFinder.offsetArenaAllocate_,
+            libBase + offsetFinder.offsetArenaPointer_,
+        };
         auto blobs = stub_asm::build(padStartAddr, translateInsnAddr, origPrologue, parentReqName,
-                                     parentReplyName);
+                                     parentReplyName, allocators);
         if (blobs.entry.size() != 16) {
             fprintf(stdout, "M2: stub_asm::build returned wrong entry size %zu\n",
                     blobs.entry.size());
