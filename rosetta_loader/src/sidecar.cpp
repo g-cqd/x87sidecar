@@ -20,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -2131,13 +2132,13 @@ mach_vm_address_t allocAndAppendInParent(mach_port_t parentTask, uint64_t origAd
                                          uint64_t tailSize) {
     // Round up to page granularity.
     newCap = (newCap + 0xFFF) & ~static_cast<uint64_t>(0xFFF);
+    std::vector<uint8_t> stash(origLive);
     mach_vm_address_t parentNew = 0;
     g_statVmSyscalls.fetch_add(1, std::memory_order_relaxed);
     if (mach_vm_allocate(parentTask, &parentNew, newCap, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
         return 0;
     }
     if (origLive > 0) {
-        std::vector<uint8_t> stash(origLive);
         if (!readTranslate(parentTask, origAddr, stash.data(), origLive) ||
             !writeTranslate(parentTask, parentNew, stash.data(), origLive)) {
             mach_vm_deallocate(parentTask, parentNew, newCap);
@@ -2156,7 +2157,7 @@ mach_vm_address_t allocAndAppendInParent(mach_port_t parentTask, uint64_t origAd
 // Run Translator and write its output back to parent's TR. Returns Some(N)
 // when translation produced a result and the write-back path completed;
 // otherwise returns None (the stub falls through to stock translate_insn).
-TranslateOutcome processTranslateRequest(mach_port_t parentTask, const TranslateRequest& req) {
+TranslateOutcome processTranslateRequest(mach_port_t parentTask, const TranslateRequest& req) try {
     TranslateOutcome out{.reply_some = false, .value = 0};
 
     // Stock may clobber cached registers after any None reply, including a
@@ -2194,6 +2195,10 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     if (req.insn_idx >= req.num_instrs) {
         return out;
     }
+    if (req.tr_addr > UINT64_MAX - kStockTRSize ||
+        req.instr_array > UINT64_MAX - req.num_instrs * sizeof(IRInstr)) {
+        return out;
+    }
 
     // Read parent's TR. Value-initialised local; we sterilise its list
     // pointers before scope end so `~TransactionalList` runs `::operator
@@ -2202,16 +2207,6 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     // stock's real 0x268 size — which we deliberately do NOT read from the
     // tracee — is deterministic zero rather than uninitialised.
     TranslationResult tr{};
-    // Read only the stock-sized TR from the tracee; x87_cache lives in our own
-    // per-thread map (keyed by TR address), not in the tracee's heap.
-    if (!readTranslate(parentTask, req.tr_addr, &tr, kStockTRSize)) {
-        return out;
-    }
-    {
-        std::scoped_lock lk(g_x87CacheMu);
-        tr.x87_cache = g_x87Cache[req.tr_addr];  // default-constructs on first use
-    }
-
     TransactionalList<Fixup>* lists[kListCount] = {
         &tr.external_fixups, &tr.internal_fixups,  &tr._fixups,
         &tr.field_B0,        &tr.dyld_stub_fixups, &tr.field_1A8,
@@ -2227,12 +2222,49 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         }
     } _sterilizer{lists};
 
+    // Read only the stock-sized TR from the tracee; x87_cache lives in our own
+    // per-thread map (keyed by TR address), not in the tracee's heap.
+    if (!readTranslate(parentTask, req.tr_addr, &tr, kStockTRSize)) {
+        return out;
+    }
+    {
+        std::scoped_lock lk(g_x87CacheMu);
+        tr.x87_cache = g_x87Cache[req.tr_addr];  // default-constructs on first use
+    }
+
     // Snapshot parent-side state we need for write-back.
     uint32_t* const origInsnData = tr.insn_buf.data;
     uint64_t const origInsnEnd = tr.insn_buf.end;
     uint64_t const origInsnCap = tr.insn_buf.end_cap;
     uint32_t const origInsnUseHeap = tr.insn_buf.use_heap;
     ThreadContextOffsets* const origTCO = tr.thread_context_offsets;
+
+    // A request may require stock's existing instruction prefix for fixup
+    // coordinates, but its spare capacity is not a local allocation request.
+    // Bound prefix retention to 64 MiB; larger translations remain with stock.
+    constexpr uint64_t kMaxLocalPrefix = 64 * 1024 * 1024;
+    constexpr uint64_t kInitialInsnCapacity = 0x4000;
+    const uint64_t origInsnAddress = reinterpret_cast<uint64_t>(origInsnData);
+    if (origInsnEnd > origInsnCap || origInsnEnd > kMaxLocalPrefix ||
+        origInsnEnd % sizeof(uint32_t) != 0 || origInsnCap % sizeof(uint32_t) != 0 ||
+        origInsnAddress % alignof(uint32_t) != 0 ||
+        (origInsnCap != 0 && origInsnData == nullptr) ||
+        origInsnCap > UINT64_MAX - origInsnAddress) {
+        std::fprintf(stderr, "[rosettax87] invalid or excessive instruction buffer; using stock\n");
+        return out;
+    }
+    for (const auto* list : lists) {
+        const uint64_t begin = reinterpret_cast<uint64_t>(list->begin);
+        const uint64_t end = reinterpret_cast<uint64_t>(list->end);
+        const uint64_t cap = reinterpret_cast<uint64_t>(list->end_cap);
+        if (begin > end || end > cap || end - begin > kMaxLocalPrefix ||
+            (begin == 0 && cap != 0) || begin % alignof(Fixup) != 0 ||
+            cap % alignof(Fixup) != 0 || (end - begin) % sizeof(Fixup) != 0 ||
+            list->_size > (end - begin) / sizeof(Fixup)) {
+            std::fprintf(stderr, "[rosettax87] invalid or excessive fixup buffer; using stock\n");
+            return out;
+        }
+    }
 
     struct ListBackup {
         Fixup* begin;
@@ -2338,7 +2370,7 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     // On the first request for a TR address it default-constructs; Translator's
     // cache.invalidate() converges it on the first block mismatch.
 
-    // Set up local insn_buf with capacity ≥ parent's. Critical: end starts at
+    // Set up local insn_buf with room for its live prefix. Critical: end starts at
     // origInsnEnd so Translator's emit/fixup offsets count in the SAME
     // coordinate space the parent uses (`data + insn_offset`). If we started
     // end at 0, fixups referencing emitted bytes would patch into parent's
@@ -2346,7 +2378,9 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     // that crashes parent with EXC_BAD_INSTRUCTION.
     //
     // The initial vector is borrowed; grow() owns only its replacements.
-    std::vector<uint8_t> localInsnVec(std::max<uint64_t>(origInsnCap, 0x4000));
+    const uint64_t localInsnCapacity =
+        std::max(kInitialInsnCapacity, std::min(origInsnCap, origInsnEnd + kInitialInsnCapacity));
+    std::vector<uint8_t> localInsnVec(localInsnCapacity);
     tr.insn_buf.data = reinterpret_cast<uint32_t*>(localInsnVec.data());
     tr.insn_buf.end = origInsnEnd;
     tr.insn_buf.end_cap = localInsnVec.size();
@@ -2475,8 +2509,8 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     uint64_t localPushedBytes[kListCount];
     for (size_t i = 0; i < kListCount; i++) {
         localPushed[i] = lists[i]->begin;
-        localPushedBytes[i] = static_cast<uint64_t>(reinterpret_cast<uint8_t*>(lists[i]->end) -
-                                                    reinterpret_cast<uint8_t*>(lists[i]->begin));
+        localPushedBytes[i] = reinterpret_cast<uint64_t>(lists[i]->end) -
+                              reinterpret_cast<uint64_t>(lists[i]->begin);
     }
     struct LocalCleanup {
         uint8_t* insn_buf;  // null if Translator never grew (vec owns)
@@ -2545,16 +2579,16 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         // Write insn_buf delta bytes (the region Translator emitted, at
         // offsets [origInsnEnd .. origInsnEnd+emitted]) back to parent.
         // Two cases:
-        //  - No grow + fits in parent's cap → mach_vm_write the tail
+        //  - Fits in parent's cap → mach_vm_write the tail
         //    in place.
-        //  - Grow OR doesn't fit → allocate a parent-side replacement,
+        //  - Doesn't fit → allocate a parent-side replacement,
         //    copy parent's existing [0..origInsnEnd] bytes over, then
         //    append our emitted slice, and pivot TR.insn_buf.data onto
         //    it.
         uint64_t finalInsnEnd = origInsnEnd + insnEmitted;
         uint32_t* finalInsnData = origInsnData;
         uint64_t finalInsnCap = origInsnCap;
-        if (!insnGrew && finalInsnEnd <= origInsnCap) {
+        if (finalInsnEnd <= origInsnCap) {
             if (insnEmitted > 0) {
                 if (!writeTranslate(parentTask, reinterpret_cast<uint64_t>(origInsnData) + origInsnEnd,
                               localInsnData + origInsnEnd, insnEmitted)) {
@@ -2581,9 +2615,9 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         for (size_t i = 0; i < kListCount; i++) {
             const auto& orig = origLists[i];
             uint64_t parentLive =
-                reinterpret_cast<uint8_t*>(orig.end) - reinterpret_cast<uint8_t*>(orig.begin);
+                reinterpret_cast<uint64_t>(orig.end) - reinterpret_cast<uint64_t>(orig.begin);
             uint64_t parentCap =
-                reinterpret_cast<uint8_t*>(orig.end_cap) - reinterpret_cast<uint8_t*>(orig.begin);
+                reinterpret_cast<uint64_t>(orig.end_cap) - reinterpret_cast<uint64_t>(orig.begin);
             uint64_t added = localPushedBytes[i];
             uint64_t newLive = parentLive + added;
 
@@ -2595,7 +2629,7 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
                     }
                 }
                 lists[i]->end =
-                    reinterpret_cast<Fixup*>(reinterpret_cast<uint8_t*>(orig.begin) + newLive);
+                    reinterpret_cast<Fixup*>(reinterpret_cast<uint64_t>(orig.begin) + newLive);
             } else {
                 uint64_t newCap = std::max(parentCap * 2, newLive);
                 mach_vm_address_t parentNew =
@@ -2669,6 +2703,12 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         }
     }
     return out;
+} catch (const std::bad_alloc&) {
+    std::fprintf(stderr, "[rosettax87] request allocation failed; using stock\n");
+    return {.reply_some = false, .value = 0};
+} catch (const std::length_error&) {
+    std::fprintf(stderr, "[rosettax87] request allocation size exceeded; using stock\n");
+    return {.reply_some = false, .value = 0};
 }
 
 // True when `kr` is a receive-side mach_msg error (0x10004xxx, bit 14 set;

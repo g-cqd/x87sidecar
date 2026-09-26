@@ -317,6 +317,7 @@ bash scripts/run_tests.sh test_arith     # one test
 python3 scripts/test_profile_paths.py    # concurrent profiler output paths
 bash scripts/run_benchmarks.sh           # build + benchmark table
 build/bin/test_assembler_buffer         # native storage and allocation failures
+build/bin/test_sidecar_transaction      # native request validation and write-back failures
 build/bin/bench_assembler_buffer        # native storage latency and capacity
 ```
 
@@ -326,6 +327,16 @@ For an AddressSanitizer build, set `ASAN_OPTIONS=allocator_may_return_null=1`
 so the impossible-size allocation cases can verify failure handling.
 The native benchmark reports median and range over nine samples after warm-up;
 it measures translation storage, not the execution speed of translated games.
+
+Initial request scratch storage uses the smaller of the tracee's capacity and its
+live instruction prefix plus 16 KiB, with a 16 KiB minimum. Instruction and fixup prefixes
+above 64 MiB fall back to stock before allocation. This is a resource budget, not a
+Rosetta format limit; unusually large translations can lose acceleration. The
+existing phase matrix observed a maximum instruction prefix of 214,540 bytes and
+capacity of 262,144 bytes on the validation host. Malformed ranges and allocation
+failures also fall back to stock, with the register cache invalidated. The native
+transaction test exercises these paths through real Mach reads and writes without
+Rosetta attachment privileges.
 
 The harness runs 90 self-checking x86-64 test binaries under stock Rosetta
 and then under the sidecar in ten configurations (default, IR off, fusions
