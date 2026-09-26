@@ -258,7 +258,10 @@ Nothing in the tree is tied to a macOS or Rosetta build number. At startup
 the loader locates what it patches by anchors that survive a rebuild, checks
 the assumptions the emitted code relies on against the installed runtime,
 and refuses a runtime that fails a check rather than patching guessed
-addresses. `x87sidecar --probe` prints that report and exits 0 only when
+addresses. Native buffer growth also fingerprints the audited allocator caller
+and lock implementation; changed code requires a new audit. See the
+[native reserve contract](docs/investigations/native-buffer-reserve.md).
+`x87sidecar --probe` prints that report and exits 0 only when
 every feature is supported; run it first after a macOS update. CI runs it
 on the current `macos-26` runner before the test suite, and it runs on
 macOS 27.
@@ -330,11 +333,14 @@ it measures translation storage, not the execution speed of translated games.
 
 Initial request scratch storage uses the smaller of the tracee's capacity and its
 live instruction prefix plus 16 KiB, with a 16 KiB minimum. Instruction and fixup prefixes
-above 64 MiB fall back to stock before allocation. This is a resource budget, not a
-Rosetta format limit; unusually large translations can lose acceleration. The
+above 64 MiB are refused before allocation. This is a resource budget, not a
+Rosetta format limit. The
 existing phase matrix observed a maximum instruction prefix of 214,540 bytes and
-capacity of 262,144 bytes on the validation host. Malformed ranges and allocation
-failures also fall back to stock, with the register cache invalidated. The native
+capacity of 262,144 bytes on the validation host. Malformed or unidentified
+requests terminate with a diagnostic. Allocation and publication failures fall
+back to stock only for recognized real opcodes, with the register cache
+invalidated. Synthetic ARPL has no stock implementation and terminates on failure.
+Insufficient parent capacity uses one native reserve and translation retry. The native
 transaction test exercises these paths through real Mach reads and writes without
 Rosetta attachment privileges.
 
