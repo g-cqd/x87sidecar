@@ -17,7 +17,9 @@ void* mmap_anonymous_rw(size_t size, int tag) {
 }
 
 void AssemblerBuffer::grow() {
-    assert(end <= end_cap);
+    assert(end <= end_cap && end % sizeof(uint32_t) == 0 && end_cap % sizeof(uint32_t) == 0);
+    assert((data != nullptr || end == 0) &&
+           reinterpret_cast<uintptr_t>(data) % alignof(uint32_t) == 0);
     // Keep both the byte count and pointer differences representable.
     constexpr auto max_capacity = static_cast<uint64_t>(PTRDIFF_MAX);
     if (end_cap > max_capacity / 2) {

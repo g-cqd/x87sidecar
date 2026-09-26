@@ -16,6 +16,8 @@ struct AssemblerBuffer {
     // Allocation failure leaves the buffer unchanged and throws std::bad_alloc.
     void emit(uint32_t value) {
         assert(end <= end_cap && end % sizeof(uint32_t) == 0 && end_cap % sizeof(uint32_t) == 0);
+        assert((data != nullptr || end_cap == 0) &&
+               reinterpret_cast<uintptr_t>(data) % alignof(uint32_t) == 0);
         if (end_cap - end < sizeof(uint32_t))
             grow();
         data[end / sizeof(uint32_t)] = value;
