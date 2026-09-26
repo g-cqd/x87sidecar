@@ -1,5 +1,9 @@
 set(X86_SAMPLE_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/tests")
 
+# Host-side storage tests also run without Rosetta attachment privileges.
+add_executable(test_assembler_buffer test_assembler_buffer.cpp)
+target_link_libraries(test_assembler_buffer PRIVATE rosetta_core)
+
 add_x86_sample(test_fldconst)
 add_x86_sample(test_detach_signals)
 add_x86_sample(test_fld)

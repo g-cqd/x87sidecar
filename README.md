@@ -312,11 +312,20 @@ tools, and the x86-64 test and benchmark binaries.
 ```bash
 bash scripts/run_tests.sh                # build + all phases
 bash scripts/run_tests.sh --no-build     # skip the build
-bash scripts/run_tests.sh --native-only  # stock Rosetta baseline only
+bash scripts/run_tests.sh --native-only  # host checks + stock Rosetta baseline
 bash scripts/run_tests.sh test_arith     # one test
 python3 scripts/test_profile_paths.py    # concurrent profiler output paths
 bash scripts/run_benchmarks.sh           # build + benchmark table
+build/bin/test_assembler_buffer         # native storage and allocation failures
+build/bin/bench_assembler_buffer        # native storage latency and capacity
 ```
+
+The buffer test needs no Rosetta attachment and also runs in `run_tests.sh`.
+`leaks --quiet --atExit -- build/bin/test_assembler_buffer` checks its allocations.
+For an AddressSanitizer build, set `ASAN_OPTIONS=allocator_may_return_null=1`
+so the impossible-size allocation cases can verify failure handling.
+The native benchmark reports median and range over nine samples after warm-up;
+it measures translation storage, not the execution speed of translated games.
 
 The harness runs 90 self-checking x86-64 test binaries under stock Rosetta
 and then under the sidecar in ten configurations (default, IR off, fusions
