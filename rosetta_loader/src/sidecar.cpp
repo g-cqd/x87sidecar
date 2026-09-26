@@ -19,6 +19,7 @@
 #include <ctime>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -150,15 +151,12 @@ void dumpBlockIfNew(mach_port_t parentTask, uint64_t module_data_ptr, uint64_t b
 // pointers would be unreachable from the parent.
 //
 // Strategy:
-//   1. Read parent's TR, ThreadContextOffsets, and IR array into locals.
-//      sizeof(tr) bytes are read in full — the loader's M2 init patched
-//      stock's TR allocator to allocate sizeof(TranslationResult) per TR
-//      so parent's heap has the full extended struct (including our
-//      appended x87_cache, OPT-1).
-//   2. RESET TR's mutable buffers to empty (data=null, end=0, end_cap=0,
-//      use_heap=1) and lists to nullptr. With use_heap=1 grow uses calloc
-//      (no munmap of foreign pointers); with empty lists push_back_slow's
-//      `delete old_begin` is `delete nullptr`, which is a no-op.
+//   1. Read the stock-sized TR, ThreadContextOffsets, and IR array into locals.
+//      The additional x87_cache lives in the sidecar's per-TR map.
+//   2. Redirect insn_buf to a local vector, preserving the parent's byte
+//      offsets. kBorrowedHeap keeps grow() from freeing that vector; it owns
+//      and releases subsequent heap replacements. Reset fixup lists to empty
+//      so their first growth cannot free a foreign pointer.
 //   3. Run Translator on `tr`. Its growth/pushes allocate fresh sidecar-
 //      local heap; the local TR's data/list pointers now name those.
 //   4. APPEND the locally-produced bytes/fixups to parent's existing
@@ -167,9 +165,8 @@ void dumpBlockIfNew(mach_port_t parentTask, uint64_t module_data_ptr, uint64_t b
 //      replacement via `mach_vm_allocate`, copy parent's existing
 //      contents over, then append the new tail. Update TR's pointers to
 //      the parent VA.
-//   5. mach_vm_write the patched TR back in full (sizeof(TranslationResult))
-//      — including x87_cache so OPT-1's cross-instruction state persists.
-//      Free our local allocations.
+//   5. Restore parent pointers and allocator mode, write back the stock-sized
+//      TR, and retain x87_cache in the sidecar map. Free local allocations.
 //
 // Parent's old buffer (when we replace it on grow) becomes orphaned in
 // parent's heap — we can't `free()` parent-side from here. The leak is
@@ -2352,13 +2349,12 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     // pre-existing prologue bytes when stock later applies them — corruption
     // that crashes parent with EXC_BAD_INSTRUCTION.
     //
-    // use_heap=1 ensures grow() picks calloc and skips its munmap-of-old-
-    // pointer branch (the "old" pointer would otherwise be foreign memory).
+    // The initial vector is borrowed; grow() owns only its replacements.
     std::vector<uint8_t> localInsnVec(std::max<uint64_t>(origInsnCap, 0x4000));
     tr.insn_buf.data = reinterpret_cast<uint32_t*>(localInsnVec.data());
     tr.insn_buf.end = origInsnEnd;
     tr.insn_buf.end_cap = localInsnVec.size();
-    tr.insn_buf.use_heap = 1;
+    tr.insn_buf.use_heap = AssemblerBuffer::kBorrowedHeap;
     for (auto& list : lists) {
         list->begin = list->end = list->end_cap = nullptr;
         list->_size = 0;
@@ -2460,11 +2456,17 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     // invalidates the persisted X87Cache, which is what a None reply that
     // skipped the translator needs.
     std::optional<int64_t> result;
+    bool allocation_failed = false;
     if (!stock_hash_hit) {
-        _bypass_guard.ran_translator = true;
-        result = Translator::translate_instruction(
-            &tr, reinterpret_cast<IRBlock*>(req.block), localIR,
-            static_cast<int64_t>(req.num_instrs), static_cast<int64_t>(req.insn_idx));
+        try {
+            result = Translator::translate_instruction(
+                &tr, reinterpret_cast<IRBlock*>(req.block), localIR,
+                static_cast<int64_t>(req.num_instrs), static_cast<int64_t>(req.insn_idx));
+            _bypass_guard.ran_translator = true;
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr, "[rosettax87] translation allocation failed; using stock\n");
+            allocation_failed = true;
+        }
         if (result.has_value()) {
             irc.next_idx = result.value();
         }
@@ -2498,6 +2500,10 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     } _cleanup{.insn_buf = insnGrew ? localInsnData : nullptr,
                .lists = {localPushed[0], localPushed[1], localPushed[2], localPushed[3],
                          localPushed[4], localPushed[5]}};
+
+    if (allocation_failed) {
+        return out;
+    }
 
     if (g_rosetta_config != nullptr && g_rosetta_config->loader_dump_emit != 0U &&
         result.has_value() && insnEmitted > 0) {

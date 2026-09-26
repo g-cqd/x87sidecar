@@ -1,6 +1,9 @@
 set(X86_SAMPLE_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/bench")
 set(X86_SAMPLE_EXTRA_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/bench_timing.h")
 
+add_executable(bench_assembler_buffer bench_assembler_buffer.cpp)
+target_link_libraries(bench_assembler_buffer PRIVATE rosetta_core)
+
 add_x86_sample(bench_constants)
 add_x86_sample(bench_load)
 add_x86_sample(bench_add)
