@@ -10,21 +10,25 @@
 //   stock translate_insn[0..16]:
 //       16-byte abs-jump to OUR_HANDLER  (movz/movk/movk x16 + br x16)
 //   trailing padding region of __TEXT segment:
-//       OUR_HANDLER  (~60 instr): saves caller regs, packs the 5×8 body
+//       OUR_HANDLER: saves caller regs, packs the 5×8 body
 //                                 args onto the stack, then issues
 //                                 mach_msg2_trap (svc -47) with
 //                                 MACH64_SEND_MQ_CALL set in options64
 //                                 for SEND|RCV.  After reply, branches
-//                                 on some_flag:
+//                                 on ReplyKind:
 //                                   1 (Some) → load body[0] into x0,
 //                                              restore, ret.
 //                                   0 (None) → restore, fall through
 //                                              to STASH below.
+//                                   2 (Reserve) → native allocation and one
+//                                                 exact original-request retry.
+//                                   3 (Fatal) → diagnostic and process exit;
+//                                               stock cannot handle this request.
 //       STASH        (4 instr):   copy of translate_insn[0..16] original bytes.
 //       STASH_JUMP   (4 instr):   abs-jump to translate_insn+16.
 //
 // Total bytes needed in trailing padding = sizeof(handler) + 16 + 16.
-// All produced bytes are arm64 instructions encoded little-endian.
+// Instructions use the little-endian arm64 encoding; handlers also embed diagnostics.
 namespace stub_asm {
 
 struct StubBlobs {
@@ -34,6 +38,14 @@ struct StubBlobs {
     // OUR_HANDLER + STASH + STASH_JUMP, contiguous; written to the
     // trailing-padding location in libRosettaRuntime's __TEXT.
     std::vector<uint8_t> handler;
+};
+
+// Verified entry points in the parent's loaded Rosetta image. Allocations stay
+// in Rosetta's translation arena and share its lifetime and failure behavior.
+struct NativeAllocators {
+    uint64_t grow;
+    uint64_t arena_allocate;
+    uint64_t arena_pointer;
 };
 
 // Build the blob bytes.
@@ -50,7 +62,7 @@ struct StubBlobs {
 //                         MAKE_SEND_ONCE; sidecar replies on the resulting
 //                         send-once and the reply lands here.
 StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t origPrologue16[16],
-                uint32_t sidecarReqName, uint32_t parentReplyName);
+                uint32_t sidecarReqName, uint32_t parentReplyName, NativeAllocators allocators);
 
 // ──── decode_opcode hook ─────────────────────────────────────────────────────
 //

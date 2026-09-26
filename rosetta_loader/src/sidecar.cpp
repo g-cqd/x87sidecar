@@ -1,4 +1,5 @@
 #include "sidecar.hpp"
+#include "translation_reply.hpp"
 
 #include <dirent.h>
 #include <libproc.h>
@@ -146,8 +147,9 @@ void dumpBlockIfNew(mach_port_t parentTask, uint64_t module_data_ptr, uint64_t b
 }
 
 // ── Cross-process marshalling helpers ───────────────────────────────────────
-// Translator + its helpers grow `insn_buf` (mmap/calloc) and append to six
-// fixup lists (`::operator new`). Both allocators land in *this* process, so
+// Our local Translator grows `insn_buf` (mmap/calloc) and appends fixups with
+// `::operator new`; stock uses its own translation arena. Local allocations
+// land in *this* process, so
 // we can't simply hand parent's pointers to Translator — the resulting
 // pointers would be unreachable from the parent.
 //
@@ -160,20 +162,19 @@ void dumpBlockIfNew(mach_port_t parentTask, uint64_t module_data_ptr, uint64_t b
 //      so their first growth cannot free a foreign pointer.
 //   3. Run Translator on `tr`. Its growth/pushes allocate fresh sidecar-
 //      local heap; the local TR's data/list pointers now name those.
-//   4. APPEND the locally-produced bytes/fixups to parent's existing
-//      buffers. If the append fits within parent's capacity we just
-//      mach_vm_write the delta. If it doesn't, allocate a parent-side
-//      replacement via `mach_vm_allocate`, copy parent's existing
-//      contents over, then append the new tail. Update TR's pointers to
-//      the parent VA.
+//   4. Preflight all instruction and fixup tails against parent's existing
+//      capacities. If growth is needed, request native reservation before any
+//      write and retry the full translation. Otherwise append tails.
 //   5. Restore parent pointers and allocator mode, write back the stock-sized
 //      TR, and retain x87_cache in the sidecar map. Free local allocations.
 //
-// Parent's old buffer (when we replace it on grow) becomes orphaned in
-// parent's heap — we can't `free()` parent-side from here. The leak is
-// per-grow only; capacity doubles each time so growths are logarithmic.
+// A failed Mach write may have modified unused tail bytes. Lengths are published
+// only in the final TR write; this is not atomic rollback of remote memory.
 
 constexpr size_t kListCount = 6;
+// Only these fields are known Fixup lists used by our translator. The other
+// list-shaped stock fields are opaque; field_B0 contains 16-byte records.
+constexpr std::array<size_t, 2> kAppendedFixupLists{0, 2};
 
 // ── OPT-1 cache storage (mode-independent) ──────────────────────────────────
 // x87_cache is per-thread, cross-instruction Translator state. It used to be
@@ -278,6 +279,9 @@ struct TranslateRequest {
 struct TranslateOutcome {
     bool reply_some;  // true → reply Some(value), else None.
     int64_t value;
+    std::array<uint64_t, 3> reserve{};
+    bool stock_fallback_safe = false;
+    bool instruction_known = false;
 };
 
 bool readParent(mach_port_t task, uint64_t addr, void* dst, size_t size) {
@@ -2123,46 +2127,32 @@ bool writeTranslate(mach_port_t task, uint64_t addr, const void* src, size_t siz
     return writeParent(task, addr, src, size);
 }
 
-// Allocate a parent-side replacement buffer of size `newCap`, copy parent's
-// existing live bytes, then append `tailSize` bytes from `tail`. On success
-// returns the parent VA of the new buffer. On any failure deallocates and
-// returns 0.
-mach_vm_address_t allocAndAppendInParent(mach_port_t parentTask, uint64_t origAddr,
-                                         uint64_t origLive, uint64_t newCap, const void* tail,
-                                         uint64_t tailSize) {
-    // Round up to page granularity.
-    newCap = (newCap + 0xFFF) & ~static_cast<uint64_t>(0xFFF);
-    std::vector<uint8_t> stash(origLive);
-    mach_vm_address_t parentNew = 0;
-    g_statVmSyscalls.fetch_add(1, std::memory_order_relaxed);
-    if (mach_vm_allocate(parentTask, &parentNew, newCap, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
-        return 0;
+// Allocation-free identification for the diagnostic stock path and for an
+// allocation failure before the full IR array could be downloaded.
+void identifyInstruction(mach_port_t parentTask, const TranslateRequest& req,
+                         TranslateOutcome& out) {
+    if (req.num_instrs == 0 || req.num_instrs > 0x10000 || req.insn_idx >= req.num_instrs ||
+        req.instr_array > UINT64_MAX - req.num_instrs * sizeof(IRInstr)) {
+        return;
     }
-    if (origLive > 0) {
-        if (!readTranslate(parentTask, origAddr, stash.data(), origLive) ||
-            !writeTranslate(parentTask, parentNew, stash.data(), origLive)) {
-            mach_vm_deallocate(parentTask, parentNew, newCap);
-            return 0;
-        }
+    IRInstr current{};
+    if (readTranslate(parentTask,
+                      req.instr_array + req.insn_idx * sizeof(IRInstr) + offsetof(IRInstr, opcode_),
+                      &current.opcode_, sizeof(current.opcode_))) {
+        out.instruction_known = current.opcode_ < kOpcodeNames.size();
+        out.stock_fallback_safe = current.opcode_ < kOpcodeName_arpl;
     }
-    if (tailSize > 0) {
-        if (!writeTranslate(parentTask, parentNew + origLive, tail, tailSize)) {
-            mach_vm_deallocate(parentTask, parentNew, newCap);
-            return 0;
-        }
-    }
-    return parentNew;
 }
 
 // Run Translator and write its output back to parent's TR. Returns Some(N)
 // when translation produced a result and the write-back path completed;
-// otherwise returns None (the stub falls through to stock translate_insn).
-TranslateOutcome processTranslateRequest(mach_port_t parentTask, const TranslateRequest& req) try {
-    TranslateOutcome out{.reply_some = false, .value = 0};
-
+// otherwise requests native reservation or declines. The wrapper refuses
+// stock fallback for unidentified requests and synthetic instructions.
+TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const TranslateRequest& req,
+                                             TranslateOutcome& out) {
     // Stock may clobber cached registers after any None reply, including a
-    // failed write-back after translation. Preserve the cache only when the
-    // complete result has reached the parent and a Some reply is ready.
+    // failed write-back after translation. Reserve retains the previous cache;
+    // Some publishes the new cache only after complete remote write-back.
     struct CacheCommitGuard {
         uint64_t tr_addr;
         bool committed = false;
@@ -2178,16 +2168,6 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         }
     } cache_commit{.tr_addr = req.tr_addr};
 
-    // X87_ALWAYS_NONE: short-circuit before any cross-process I/O.  The stub
-    // sees a None reply, falls through to STASH, and stock translates the
-    // op.  Hook + IPC mechanics still exercise (so we can A/B it against
-    // X87_DISABLE_HOOK=1, which skips the hook entirely).  If a real
-    // freeze repros under DISABLE_HOOK=0 + ALWAYS_NONE=1, the bug is in
-    // the marshalling itself; if not, it's in our emitted code.
-    if (g_rosetta_config != nullptr && g_rosetta_config->loader_always_none != 0U) {
-        return out;
-    }
-
     constexpr uint64_t kMaxNumInstrs = 0x10000;
     if (req.num_instrs == 0 || req.num_instrs > kMaxNumInstrs) {
         return out;
@@ -2197,6 +2177,13 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     }
     if (req.tr_addr > UINT64_MAX - kStockTRSize ||
         req.instr_array > UINT64_MAX - req.num_instrs * sizeof(IRInstr)) {
+        return out;
+    }
+
+    // Even the diagnostic stock-only mode must identify synthetic ARPL,
+    // which has no stock implementation. This probe needs no allocation.
+    if (g_rosetta_config != nullptr && g_rosetta_config->loader_always_none != 0U) {
+        identifyInstruction(parentTask, req, out);
         return out;
     }
 
@@ -2241,27 +2228,29 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
 
     // A request may require stock's existing instruction prefix for fixup
     // coordinates, but its spare capacity is not a local allocation request.
-    // Bound prefix retention to 64 MiB; larger translations remain with stock.
+    // Bound prefix retention to 64 MiB; refuse excessive requests before
+    // reading dependent buffers. Unidentified requests cannot use stock.
     constexpr uint64_t kMaxLocalPrefix = 64 * 1024 * 1024;
     constexpr uint64_t kInitialInsnCapacity = 0x4000;
     const uint64_t origInsnAddress = reinterpret_cast<uint64_t>(origInsnData);
     if (origInsnEnd > origInsnCap || origInsnEnd > kMaxLocalPrefix ||
         origInsnEnd % sizeof(uint32_t) != 0 || origInsnCap % sizeof(uint32_t) != 0 ||
-        origInsnAddress % alignof(uint32_t) != 0 ||
-        (origInsnCap != 0 && origInsnData == nullptr) ||
-        origInsnCap > UINT64_MAX - origInsnAddress) {
-        std::fprintf(stderr, "[rosettax87] invalid or excessive instruction buffer; using stock\n");
+        origInsnAddress % alignof(uint32_t) != 0 || (origInsnCap != 0 && origInsnData == nullptr) ||
+        origInsnCap > UINT64_MAX - origInsnAddress || origInsnUseHeap > 1) {
+        std::fprintf(stderr,
+                     "[rosettax87] invalid or excessive instruction buffer; translation refused\n");
         return out;
     }
-    for (const auto* list : lists) {
+    for (const size_t i : kAppendedFixupLists) {
+        const auto* list = lists[i];
         const uint64_t begin = reinterpret_cast<uint64_t>(list->begin);
         const uint64_t end = reinterpret_cast<uint64_t>(list->end);
         const uint64_t cap = reinterpret_cast<uint64_t>(list->end_cap);
-        if (begin > end || end > cap || end - begin > kMaxLocalPrefix ||
-            (begin == 0 && cap != 0) || begin % alignof(Fixup) != 0 ||
-            cap % alignof(Fixup) != 0 || (end - begin) % sizeof(Fixup) != 0 ||
+        if (begin > end || end > cap || end - begin > kMaxLocalPrefix || (begin == 0 && cap != 0) ||
+            begin % alignof(Fixup) != 0 || cap % alignof(Fixup) != 0 ||
+            (end - begin) % sizeof(Fixup) != 0 || (cap - begin) % sizeof(Fixup) != 0 ||
             list->_size > (end - begin) / sizeof(Fixup)) {
-            std::fprintf(stderr, "[rosettax87] invalid or excessive fixup buffer; using stock\n");
+            std::fprintf(stderr, "[rosettax87] invalid fixup buffer; translation refused\n");
             return out;
         }
     }
@@ -2305,7 +2294,7 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
                 win = kProbeWindow;
             }
             if (!readTranslate(parentTask, req.instr_array + req.insn_idx * sizeof(IRInstr), probe,
-                         win * sizeof(IRInstr))) {
+                               win * sizeof(IRInstr))) {
                 return out;
             }
             reuse = std::memcmp(probe, &irc.ir[req.insn_idx], win * sizeof(IRInstr)) == 0;
@@ -2315,7 +2304,7 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         } else {
             irc.ir.resize(req.num_instrs);
             if (!readTranslate(parentTask, req.instr_array, irc.ir.data(),
-                         req.num_instrs * sizeof(IRInstr))) {
+                               req.num_instrs * sizeof(IRInstr))) {
                 // Don't leave a half-valid entry behind: the vector was
                 // already resized, so stale keys could pair with the wrong
                 // length and index out of bounds on a later request.
@@ -2332,6 +2321,11 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         irc.next_idx = req.insn_idx + 1;
     }
     IRInstr* const localIR = irc.ir.data();
+    out.instruction_known = localIR[req.insn_idx].opcode_ < kOpcodeNames.size();
+    out.stock_fallback_safe = localIR[req.insn_idx].opcode_ < kOpcodeName_arpl;
+    if (!out.instruction_known) {
+        return out;
+    }
 
     if (origTCO == nullptr) {
         return out;
@@ -2403,8 +2397,8 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         fflush(stdout);
     }
 
-    dumpBlockIfNew(parentTask, reinterpret_cast<uint64_t>(tr.ir_module_data), req.block,
-                   localIR, req.num_instrs);
+    dumpBlockIfNew(parentTask, reinterpret_cast<uint64_t>(tr.ir_module_data), req.block, localIR,
+                   req.num_instrs);
 
     // X87_STOCK_HASH_LIST / X87_STOCK_OPS hand whole blocks to stock, by
     // IR-content hash (profile::hash_ir_stream, the key the bridge and
@@ -2492,7 +2486,7 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
                 &tr, reinterpret_cast<IRBlock*>(req.block), localIR,
                 static_cast<int64_t>(req.num_instrs), static_cast<int64_t>(req.insn_idx));
         } catch (const std::bad_alloc&) {
-            std::fprintf(stderr, "[rosettax87] translation allocation failed; using stock\n");
+            std::fprintf(stderr, "[rosettax87] translation allocation failed\n");
             allocation_failed = true;
         }
         if (result.has_value()) {
@@ -2509,8 +2503,8 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     uint64_t localPushedBytes[kListCount];
     for (size_t i = 0; i < kListCount; i++) {
         localPushed[i] = lists[i]->begin;
-        localPushedBytes[i] = reinterpret_cast<uint64_t>(lists[i]->end) -
-                              reinterpret_cast<uint64_t>(lists[i]->begin);
+        localPushedBytes[i] =
+            reinterpret_cast<uint64_t>(lists[i]->end) - reinterpret_cast<uint64_t>(lists[i]->begin);
     }
     struct LocalCleanup {
         uint8_t* insn_buf;  // null if Translator never grew (vec owns)
@@ -2533,6 +2527,57 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         return out;
     }
 
+    if (result.has_value()) {
+        // Reserve in the parent with its native allocator before publishing any
+        // generated bytes. Retrying preserves the complete IR stream and its
+        // native-state boundary; no instruction is handed back to stock merely
+        // because the optimized run needs more storage.
+        if (insnEmitted > origInsnCap - origInsnEnd) {
+            if (tr.insn_buf.end > kMaxReserveBytes) {
+                return out;
+            }
+            uint64_t capacity = origInsnCap == 0 ? kInitialInsnCapacity : origInsnCap;
+            while (capacity < tr.insn_buf.end && capacity <= kMaxReserveBytes / 2) {
+                capacity *= 2;
+            }
+            if (capacity < tr.insn_buf.end) {
+                return out;
+            }
+            out.reserve[0] = tr.insn_buf.end;
+        }
+        for (size_t i = 0; i < kListCount; ++i) {
+            if (localPushedBytes[i] == 0) {
+                continue;
+            }
+            const auto known = std::ranges::find(kAppendedFixupLists, i);
+            if (known == kAppendedFixupLists.end()) {
+                out.reserve = {};
+                return out;
+            }
+            const uint64_t begin = reinterpret_cast<uint64_t>(origLists[i].begin);
+            const uint64_t end = reinterpret_cast<uint64_t>(origLists[i].end);
+            const uint64_t cap = reinterpret_cast<uint64_t>(origLists[i].end_cap);
+            if (localPushedBytes[i] > cap - end) {
+                const uint64_t required = end - begin + localPushedBytes[i];
+                if (required > kMaxReserveBytes) {
+                    out.reserve = {};
+                    return out;
+                }
+                const uint64_t doubled =
+                    std::min(cap - begin, (kMaxReserveBytes / sizeof(Fixup) / 2) * sizeof(Fixup)) * 2;
+                out.reserve[1 + (known - kAppendedFixupLists.begin())] =
+                    std::max(required, doubled);
+            }
+        }
+        if (std::ranges::any_of(out.reserve, [](uint64_t size) { return size != 0; })) {
+            // No stock instruction runs between Reserve and the retry, so the
+            // previously committed cache remains valid. The speculative local
+            // cache is discarded with this request.
+            cache_commit.committed = true;
+            return out;
+        }
+    }
+
     if (g_rosetta_config != nullptr && g_rosetta_config->loader_dump_emit != 0U &&
         result.has_value() && insnEmitted > 0) {
         // Hexdump the emitted AArch64 words of this request (guest pc +
@@ -2553,16 +2598,9 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         fflush(stdout);
     }
 
-    // We always write the TR back, even on None — Translator's default case
-    // (and other unhandled paths) calls cache.invalidate() and resets the
-    // scratch register masks; if we don't propagate those, parent ends up
-    // with stale `cache.gprs_valid=1` from the previous Some translation
-    // while stock's now-running translate_insn (for the unhandled opcode)
-    // happily clobbers the GPRs the cache claims are still holding TOP /
-    // base. The next x87 op would then trust the cache and emit wrong code.
-    // Restore parent VAs in TR before any conditional data writes below;
-    // the data-write path will re-pivot insn_buf/list pointers if grow
-    // happened.
+    // Propagate scratch-mask updates on normal translator returns, including
+    // None. The cache guard invalidates sidecar register state on every fallback.
+    // Restore parent-owned pointers and allocator modes before publishing sizes.
     tr.insn_buf.data = origInsnData;
     tr.insn_buf.end = origInsnEnd;
     tr.insn_buf.end_cap = origInsnCap;
@@ -2576,78 +2614,23 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
     }
 
     if (result.has_value()) {
-        // Write insn_buf delta bytes (the region Translator emitted, at
-        // offsets [origInsnEnd .. origInsnEnd+emitted]) back to parent.
-        // Two cases:
-        //  - Fits in parent's cap → mach_vm_write the tail
-        //    in place.
-        //  - Doesn't fit → allocate a parent-side replacement,
-        //    copy parent's existing [0..origInsnEnd] bytes over, then
-        //    append our emitted slice, and pivot TR.insn_buf.data onto
-        //    it.
-        uint64_t finalInsnEnd = origInsnEnd + insnEmitted;
-        uint32_t* finalInsnData = origInsnData;
-        uint64_t finalInsnCap = origInsnCap;
-        if (finalInsnEnd <= origInsnCap) {
-            if (insnEmitted > 0) {
-                if (!writeTranslate(parentTask, reinterpret_cast<uint64_t>(origInsnData) + origInsnEnd,
-                              localInsnData + origInsnEnd, insnEmitted)) {
-                    return out;
-                }
-            }
-        } else {
-            uint64_t newCap = std::max(origInsnCap * 2, finalInsnEnd);
-            mach_vm_address_t parentNew = allocAndAppendInParent(
-                parentTask, reinterpret_cast<uint64_t>(origInsnData), origInsnEnd, newCap,
-                localInsnData + origInsnEnd, insnEmitted);
-            if (parentNew == 0) {
+        if (!writeTranslate(parentTask, origInsnAddress + origInsnEnd, localInsnData + origInsnEnd,
+                            insnEmitted)) {
+            return out;
+        }
+        tr.insn_buf.end = origInsnEnd + insnEmitted;
+
+        for (const size_t i : kAppendedFixupLists) {
+            const uint64_t end = reinterpret_cast<uint64_t>(origLists[i].end);
+            if (!writeTranslate(parentTask, end, localPushed[i], localPushedBytes[i])) {
                 return out;
             }
-            finalInsnData = reinterpret_cast<uint32_t*>(parentNew);
-            finalInsnCap = (newCap + 0xFFF) & ~static_cast<uint64_t>(0xFFF);
-        }
-        tr.insn_buf.data = finalInsnData;
-        tr.insn_buf.end = finalInsnEnd;
-        tr.insn_buf.end_cap = finalInsnCap;
-
-        // Append each list's pushed entries to parent — same fits-or-grow
-        // split.
-        for (size_t i = 0; i < kListCount; i++) {
-            const auto& orig = origLists[i];
-            uint64_t parentLive =
-                reinterpret_cast<uint64_t>(orig.end) - reinterpret_cast<uint64_t>(orig.begin);
-            uint64_t parentCap =
-                reinterpret_cast<uint64_t>(orig.end_cap) - reinterpret_cast<uint64_t>(orig.begin);
-            uint64_t added = localPushedBytes[i];
-            uint64_t newLive = parentLive + added;
-
-            if (newLive <= parentCap) {
-                if (added > 0) {
-                    if (!writeTranslate(parentTask, reinterpret_cast<uint64_t>(orig.end), localPushed[i],
-                                  added)) {
-                        return out;
-                    }
-                }
-                lists[i]->end =
-                    reinterpret_cast<Fixup*>(reinterpret_cast<uint64_t>(orig.begin) + newLive);
-            } else {
-                uint64_t newCap = std::max(parentCap * 2, newLive);
-                mach_vm_address_t parentNew =
-                    allocAndAppendInParent(parentTask, reinterpret_cast<uint64_t>(orig.begin),
-                                           parentLive, newCap, localPushed[i], added);
-                if (parentNew == 0) {
-                    return out;
-                }
-                uint64_t roundedCap = (newCap + 0xFFF) & ~static_cast<uint64_t>(0xFFF);
-                lists[i]->begin = reinterpret_cast<Fixup*>(parentNew);
-                lists[i]->end = reinterpret_cast<Fixup*>(parentNew + newLive);
-                lists[i]->end_cap = reinterpret_cast<Fixup*>(parentNew + roundedCap);
-            }
+            lists[i]->end = reinterpret_cast<Fixup*>(end + localPushedBytes[i]);
         }
     }
 
     // Write back only the stock-sized TR (propagates scratch-mask updates and
-    // any pivoted buffer pointers from the Some path above). x87_cache is NOT
+    // appended lengths). x87_cache is NOT
     // written to the tracee — it lives in g_x87Cache — so the tracee's TR needs
     // no enlargement and the M2 install needs no TR-size patch.
     if (!writeTranslate(parentTask, req.tr_addr, &tr, kStockTRSize)) {
@@ -2689,9 +2672,9 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         const uint16_t op = localIR[req.insn_idx].opcode();
         // stock_hash_hit: the None reply is a deliberate whole-block
         // exclusion, not a missing handler.
-        const bool deliberate = stock_hash_hit ||
-                                std::ranges::find(kKnownFallThrough, op) != kKnownFallThrough.end();
-        if (!deliberate) {
+        const bool deliberate =
+            stock_hash_hit || std::ranges::find(kKnownFallThrough, op) != kKnownFallThrough.end();
+        if (!deliberate && out.stock_fallback_safe) {
             const char* name = (op < kOpcodeNames.size()) ? kOpcodeNames[op] : "?";
             fprintf(stdout,
                     "[rosettax87] UNHANDLED x87 opcode %s (0x%x) at "
@@ -2703,12 +2686,33 @@ TranslateOutcome processTranslateRequest(mach_port_t parentTask, const Translate
         }
     }
     return out;
-} catch (const std::bad_alloc&) {
-    std::fprintf(stderr, "[rosettax87] request allocation failed; using stock\n");
-    return {.reply_some = false, .value = 0};
-} catch (const std::length_error&) {
-    std::fprintf(stderr, "[rosettax87] request allocation size exceeded; using stock\n");
-    return {.reply_some = false, .value = 0};
+}
+
+TranslateOutcome processTranslateRequest(mach_port_t parentTask, const TranslateRequest& req) {
+    TranslateOutcome out{.reply_some = false, .value = 0};
+    try {
+        out = processTranslateRequestImpl(parentTask, req, out);
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr, "[rosettax87] request allocation failed\n");
+        if (!out.instruction_known) {
+            identifyInstruction(parentTask, req, out);
+        }
+    } catch (const std::length_error&) {
+        std::fprintf(stderr, "[rosettax87] request allocation size exceeded\n");
+        if (!out.instruction_known) {
+            identifyInstruction(parentTask, req, out);
+        }
+    }
+    const bool reserve = std::ranges::any_of(out.reserve, [](uint64_t size) { return size != 0; });
+    if (!out.reply_some && !reserve && !out.stock_fallback_safe) {
+        out.value = out.instruction_known ? kOpcodeName_arpl : -1;
+        std::fprintf(stderr, out.instruction_known
+                                 ? "[rosettax87] ARPL translation failed; stock has no ARPL "
+                                   "implementation, stopping the parent\n"
+                                 : "[rosettax87] invalid or unidentified translation request; "
+                                   "unsafe stock fallback refused\n");
+    }
+    return out;
 }
 
 // True when `kr` is a receive-side mach_msg error (0x10004xxx, bit 14 set;
@@ -2727,8 +2731,7 @@ void runReceiveLoop(mach_port_t servicePort, mach_port_t parentTaskPort) {
 
     struct ReplyMsg {
         mach_msg_header_t hdr;
-        uint64_t result;
-        uint64_t some_flag;  // 1 = Some(result), 0 = None (fall through)
+        TranslationReply payload;
     };
 
     uint64_t send_failures = 0;
@@ -2800,8 +2803,15 @@ void runReceiveLoop(mach_port_t servicePort, mach_port_t parentTaskPort) {
             reply->hdr.msgh_local_port = MACH_PORT_NULL;
             reply->hdr.msgh_voucher_port = MACH_PORT_NULL;
             reply->hdr.msgh_id = reqId;  // echo for transaction match
-            reply->result = outcome.reply_some ? static_cast<uint64_t>(outcome.value) : 0;
-            reply->some_flag = outcome.reply_some ? 1U : 0U;
+            const bool reserve = std::ranges::any_of(
+                outcome.reserve, [](uint64_t capacity) { return capacity != 0; });
+            reply->payload = {
+                .result = reserve ? outcome.reserve[0] : static_cast<uint64_t>(outcome.value),
+                .kind = reserve ? ReplyKind::Reserve
+                                : outcome.reply_some ? ReplyKind::Some
+                                  : outcome.stock_fallback_safe ? ReplyKind::None : ReplyKind::Fatal,
+                .fixup_capacities = {outcome.reserve[1], outcome.reserve[2]},
+            };
             replyPending = true;
         } else if (replyPort != MACH_PORT_NULL &&
                    (hdr->msgh_bits & MACH_MSGH_BITS_REMOTE_MASK) == MACH_MSG_TYPE_MOVE_SEND_ONCE) {
@@ -2979,8 +2989,7 @@ bool spawnReceiveThread(mach_port_t servicePort, mach_port_t parentTaskPort) {
                         path.c_str());
             }
         } else {
-            fprintf(stdout, "[rosettax87] X87_PROFILE: dumping IR streams to '%s'\n",
-                    path.c_str());
+            fprintf(stdout, "[rosettax87] X87_PROFILE: dumping IR streams to '%s'\n", path.c_str());
         }
         fflush(stdout);
     }
