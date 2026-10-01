@@ -602,22 +602,99 @@ int emit_inline_f2xm1(TranslationResult& a1, AssemblerBuffer& buf, int Xbase, in
     }
 }
 
-// Body of inline_log2: given Din (a positive double, 0/inf/NaN excluded
-// per x87 spec) and a materialised Xconst, computes log2(Din) into
-// Dd_out.  Port of optimized-routines' AdvSIMD inline_log2
-// (math/aarch64/advsimd/log2.c).
+// Body of inline_log2: given Din and a materialised Xconst, computes
+// log2(Din) into Dd_out.  Port of optimized-routines' AdvSIMD inline_log2
+// (math/aarch64/advsimd/log2.c), which is defined only for a positive
+// NORMAL double, wrapped in the domain guard the x87 instructions need.
 //
 // Allocates internal scratch.  Caller still owns Din and Xconst — this
 // function neither frees nor modifies them.
 //
-// GPR pressure: peaks at 4 scratch (Xu, Xu_off, Xtmp, plus Xconst).
+// GPR pressure: peaks at 3 scratch (Xu, Xu_off, Xtmp/Xk, plus
+// Xconst); the special-case tail peaks at 3.
 // FPR pressure: peaks at ~6 (Dz, Dr, Dr2, Dinvc, Dlog2c, Dkd, Dhi, Dy_poly).
 void emit_inline_log2(TranslationResult& a1, AssemblerBuffer& buf, int Din, int Xconst,
                       int Dd_out) {
-    // 1. u = bits(Din);  u_off = u - off
+    // ── 0. Domain guard ─────────────────────────────────────────────────
+    // The table algorithm is defined only for a positive normal double.
+    // x87 defines a result for every other input and stock Rosetta
+    // produces it, so those inputs are split off here instead of being
+    // run through the bit twiddling below, which turned them into
+    // plausible finite numbers near ±1022 — far worse than an infinity or
+    // a NaN, because a wrong finite value survives a comparison.
+    //
+    //   ±0        → log2 = −∞ (x87 raises ZE)
+    //   x < 0     → the real indefinite QNaN (x87 raises IE)
+    //   +∞        → +∞
+    //   NaN       → the operand, quieted
+    //
+    // A positive subnormal is *inside* log2's domain but outside the
+    // algorithm's: its exponent field is zero, so k came out as if the
+    // value were the smallest normal (log2 of 2^-1074 returned −1022).
+    // It is renormalised below into a *synthetic* u.
+    //
+    // Only u's low 52 bits reach z: step 3 computes
+    //   iz = u − (u_off & sign_exp_mask) = off + ((u − off) mod 2^52),
+    // whose exponent is always off's.  k is ASR(u − off, 52), plain
+    // two's-complement arithmetic on the high bits.  So a synthetic u may
+    // carry a biased exponent of zero or below — which binary64 itself
+    // cannot — and both k and z still come out exact.  For a subnormal
+    // with its leading one at bit p = 63 − clz:
+    //   mantissa field = (u << (clz − 11)) & 2^52−1
+    //   biased exponent = p − 51 = 12 − clz        (≤ 0, hence the ADD)
+    // That keeps the fix free of any register live across the body, which
+    // the scratch pool has no room for.
+    //
+    // Flag-free throughout (LSR + CBZ/CBNZ/TBZ, no CMP): guest EFLAGS may
+    // be live in NZCV across this op, as the plain-SUB notes below say.
+    // Every branch goes forward, so the runtime's instruction map stays
+    // valid for a signal landing inside the run.
     const int Xu = alloc_free_gpr(a1);
-    emit_fmov_d_to_x(buf, Xu, Din);
+    size_t to_special_zero = 0;
+    size_t to_special_high = 0;
+    {
+        const int Xt = alloc_free_gpr(a1);
+        const int Xt2 = alloc_free_gpr(a1);
+        emit_fmov_d_to_x(buf, Xu, Din);
+        // LSR Xt, Xu, #52 — sign bit and biased exponent together.
+        emit_bitfield(buf, /*is_64bit=*/1, /*opc=UBFM*/ 2, /*N=*/1, /*immr=*/52, /*imms=*/63, Xu,
+                      Xt);
+        const auto high_exp = buf.end;
+        emit_cbz(buf, /*is_64bit=*/1, /*is_nz=*/1, Xt, 0);  // CBNZ Xt, .high
 
+        // Exponent field zero and sign clear: +0 or a positive subnormal.
+        to_special_zero = buf.end;
+        emit_cbz(buf, 1, /*is_nz=*/0, Xu, 0);  // CBZ Xu, .special  (+0)
+        buf.emit(0xDAC01000U | (static_cast<uint32_t>(Xu) << 5) |
+                 static_cast<uint32_t>(Xt));                      // CLZ Xt, Xu
+        emit_add_imm(buf, 1, /*is_sub=*/1, 0, 0, 11, Xt, Xt2);    // Xt2 = clz - 11
+        emit_lslv(buf, 1, /*Rm=*/Xt2, /*Rn=*/Xu, /*Rd=*/Xu);      // u <<= clz - 11
+        LogicalImmEncoding enc_mant52;
+        is_bitmask_immediate(/*is_64bit=*/true, 0x000FFFFFFFFFFFFFULL, enc_mant52);
+        emit_and_imm(buf, 1, Xu, enc_mant52.N, enc_mant52.immr, enc_mant52.imms, Xu);
+        emit_load_immediate(a1, 1, 12, Xt2);
+        emit_add_sub_shifted_reg(buf, 1, /*is_sub=*/1, 0, 0, /*Rm=*/Xt, 0, /*Rn=*/Xt2,
+                                 /*Rd=*/Xt2);                      // Xt2 = 12 - clz
+        emit_bitfield(buf, 1, 2, 1, /*immr=*/12, /*imms=*/11, Xt2, Xt2);  // Xt2 <<= 52
+        emit_add_sub_shifted_reg(buf, 1, /*is_sub=*/0, 0, 0, /*Rm=*/Xt2, 0, /*Rn=*/Xu,
+                                 /*Rd=*/Xu);  // synthetic u
+        const auto have_u = buf.end;
+        emit_b(buf, 0);
+
+        buf.data[high_exp / 4] |= static_cast<uint32_t>((buf.end - high_exp) / 4) << 5;
+        // sign|exp >= 0x7FF covers +inf, +NaN and every negative input,
+        // tested without touching NZCV: ((sign|exp) + 1) >> 11 is nonzero
+        // exactly then.
+        emit_add_imm(buf, 1, 0, 0, 0, 1, Xt, Xt);
+        emit_bitfield(buf, 1, 2, 1, /*immr=*/11, /*imms=*/63, Xt, Xt);
+        to_special_high = buf.end;
+        emit_cbz(buf, 1, /*is_nz=*/1, Xt, 0);  // CBNZ Xt, .special
+        buf.data[have_u / 4] = 0x14000000U | static_cast<uint32_t>((buf.end - have_u) / 4);
+        free_gpr(a1, Xt2);
+        free_gpr(a1, Xt);
+    }
+
+    // 1. u_off = u - off
     const int Xu_off = alloc_free_gpr(a1);
     {
         const int Xtmp = alloc_free_gpr(a1);
@@ -750,6 +827,54 @@ void emit_inline_log2(TranslationResult& a1, AssemblerBuffer& buf, int Din, int 
     free_fpr(a1, Dy);
     free_fpr(a1, Dr2);
     free_fpr(a1, Dhi);
+
+    // ── 11. Special-case tail ───────────────────────────────────────────
+    // Reached only from the domain guard, so Din still holds the original
+    // operand (the body neither reads nor writes it after step 1).  Still
+    // flag-free, still forward-only.
+    const auto to_done = buf.end;
+    emit_b(buf, 0);
+    buf.data[to_special_zero / 4] |= static_cast<uint32_t>((buf.end - to_special_zero) / 4) << 5;
+    buf.data[to_special_high / 4] |= static_cast<uint32_t>((buf.end - to_special_high) / 4) << 5;
+    {
+        const int Xa = alloc_free_gpr(a1);
+        const int Xabs = alloc_free_gpr(a1);
+        const int Xt = alloc_free_gpr(a1);
+        emit_fmov_d_to_x(buf, Xa, Din);
+        LogicalImmEncoding enc_abs;
+        is_bitmask_immediate(/*is_64bit=*/true, 0x7FFFFFFFFFFFFFFFULL, enc_abs);
+        emit_and_imm(buf, 1, Xabs, enc_abs.N, enc_abs.immr, enc_abs.imms, Xa);
+
+        // NaN first, so it beats the sign test: |x| > inf_bits.
+        emit_load_immediate(a1, 1, 0x7FF0000000000000ULL, Xt);
+        emit_add_sub_shifted_reg(buf, 1, /*is_sub=*/1, 0, 0, /*Rm=*/Xabs, 0, /*Rn=*/Xt, /*Rd=*/Xt);
+        const auto not_nan = buf.end;
+        buf.emit(0xB6000000U | (31U << 19) | static_cast<uint32_t>(Xt));  // TBZ Xt, #63, .not_nan
+        LogicalImmEncoding enc_quiet;
+        is_bitmask_immediate(true, 0x0008000000000000ULL, enc_quiet);
+        emit_orr_imm(buf, 1, Xa, Xa, enc_quiet.N, enc_quiet.immr, enc_quiet.imms);
+        emit_fmov_x_to_d(buf, Dd_out, Xa);
+        const auto nan_done = buf.end;
+        emit_b(buf, 0);
+
+        buf.data[not_nan / 4] |= static_cast<uint32_t>((buf.end - not_nan) / 4) << 5;
+        emit_load_immediate(a1, 1, 0xFFF0000000000000ULL, Xt);  // ±0 → -inf
+        const auto emit_zero = buf.end;
+        emit_cbz(buf, 1, /*is_nz=*/0, Xabs, 0);
+        emit_load_immediate(a1, 1, 0xFFF8000000000000ULL, Xt);  // x < 0 → indefinite
+        const auto emit_neg = buf.end;
+        buf.emit(0xB7000000U | (31U << 19) | static_cast<uint32_t>(Xa));  // TBNZ Xa, #63, .emit
+        emit_load_immediate(a1, 1, 0x7FF0000000000000ULL, Xt);  // +inf
+        buf.data[emit_zero / 4] |= static_cast<uint32_t>((buf.end - emit_zero) / 4) << 5;
+        buf.data[emit_neg / 4] |= static_cast<uint32_t>((buf.end - emit_neg) / 4) << 5;
+        emit_fmov_x_to_d(buf, Dd_out, Xt);
+
+        buf.data[nan_done / 4] = 0x14000000U | static_cast<uint32_t>((buf.end - nan_done) / 4);
+        free_gpr(a1, Xt);
+        free_gpr(a1, Xabs);
+        free_gpr(a1, Xa);
+    }
+    buf.data[to_done / 4] = 0x14000000U | static_cast<uint32_t>((buf.end - to_done) / 4);
 }
 
 // FPR-level core of fyl2x: returns a freshly-owned pool FPR holding
@@ -763,7 +888,10 @@ void emit_inline_log2(TranslationResult& a1, AssemblerBuffer& buf, int Din, int 
 int emit_inline_fyl2x_core(TranslationResult& a1, AssemblerBuffer& buf, int Dy_in, int Dx_in,
                            int Xconst) {
     emit_inline_log2(a1, buf, Dx_in, Xconst, /*Dd_out=*/Dx_in);  // Dx_in := log2(Dx_in)
-    emit_fmul_f64(buf, Dx_in, Dx_in, Dy_in);                     // Dx_in *= Dy_in
+    // y first: with two NaNs ARM's FMUL returns the first operand's, and
+    // x87 lets a NaN in ST(1) win over the indefinite log2 of a negative
+    // ST(0) produces — fyl2x(qnan, -2) is the operand's NaN on stock.
+    emit_fmul_f64(buf, Dx_in, Dy_in, Dx_in);                     // Dx_in = Dy_in * log2(x)
     free_fpr(a1, Dy_in);
     return Dx_in;
 }
@@ -1364,7 +1492,7 @@ int emit_inline_fyl2xp1(TranslationResult& a1, AssemblerBuffer& buf, int Xbase, 
     free_fpr(a1, Dt);
     free_gpr(a1, Xconst);
 
-    emit_fmul_f64(buf, Dx, Dx, Dy);
+    emit_fmul_f64(buf, Dx, Dy, Dx);  // y first — see emit_inline_fyl2x_core
     free_fpr(a1, Dy);
     return Dx;
 }
