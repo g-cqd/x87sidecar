@@ -379,6 +379,8 @@ knowing. Bracketed values are defaults.
 | `X87_DISABLE_X87_IR=1` | direct translator only, no IR pipeline |
 | `X87_DISABLE_ALL_FUSIONS=1`, `X87_DISABLE_FUSIONS=f1,f2` | disable every fusion, or the named ones (`--help` lists the names) |
 | `X87_DISABLE_SINGLE_FAST=1`, `X87_DISABLE_CACHE=1` | disable the single-op fast path, the cross-instruction register cache |
+| `X87_FUSE_GAP_STRICT=1` | `fld_gap_fstp` copies an `fld m32/m64`, up to four independent integer/SSE instructions and an `fstp m32/m64` as one load and one store at the `fld`, with no x87 state traffic. By default the instructions between may touch memory provably disjoint from the target; `=1` fuses only when they touch none. Rules and deviations: [docs/internals.md](docs/internals.md#fld_gap_fstp-float-copies-around-unrelated-instructions) [off] |
+| `X87_LOG_GAP_FUSE=1` | one stderr line per `fld_gap_fstp` copy fused |
 
 Per-block knobs, keyed by the content hash `profile_analyze` prints, for
 bisecting a suspected miscompile in a live workload or working around one at

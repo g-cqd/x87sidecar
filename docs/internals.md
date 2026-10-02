@@ -165,3 +165,59 @@ results are routine: a test binary produces about forty of them containing
 neither encoding. An `INVALID` only becomes a trap if the guest executes that
 address. `X87_NO_DECODE_HOOK=1` disables the stub, which makes both encodings
 trap the way they do under stock Rosetta.
+
+## fld_gap_fstp: float copies around unrelated instructions
+
+Far Cry 2's hot x87 code is mostly isolated `flds` / `fstps` pairs with SSE in
+between (`movss %xmm7,0x20(%esi); flds (%eax); movss %xmm1,0x4(%esi);
+fstps 0x30(%esi)`). Every x87 instruction ends a run, so each of the two was
+translated alone, and a lone reply costs far more than its data movement: the
+native-state boundary converts every live stack slot f80 to f64 on entry and
+back on exit, and the single-op path adds a status/tag read-modify-write. A
+push followed by a pop is a net no-op on the x87 state, so the fusion does the
+copy at the `fld` (load, the same `fcvt` conversions the unfused path uses,
+store) without touching x87 state or running the boundary, and the `fstp`'s
+reply is empty. The `fld`'s reply records the pairing in the cache; the
+`fstp`'s reply is a no-op only if that record is there, so a `fld` that stock
+translated itself never leaves a lone no-op `fstp`. Adjacent `fld`/`fstp` that
+form a whole run are fused the same way (one reply, both consumed).
+
+The target store is performed before the gap instructions. What makes that
+unobservable, all checked on the block's IR:
+
+- the gap is at most four instructions from a whitelist of integer and SSE
+  instructions whose operand roles are known (operand 0 is the only
+  destination); no branch, call, string op, push/pop, MMX, FWAIT or x87;
+- no gap instruction writes a register the `fstp` address uses;
+- every memory operand in the gap has the same base, index and scale as the
+  target and a non-overlapping displacement range, or is an absolute address
+  with a non-overlapping range. Anything else may alias and rejects the
+  fusion. `X87_FUSE_GAP_STRICT=1` rejects every gap that touches memory;
+- run bridging keeps priority where it would join the `fld` with later x87.
+
+Values are bit-identical to the unfused replies, including signalling NaNs
+(an f64 to f64 copy quiets them in integer registers, as hardware and the
+boundary conversion do; the older adjacent `fld_fstp` peephole it replaces did
+not). Deviations from the unfused path, none visible to single-threaded code
+that does not fault: other threads can observe the target store ahead of up to
+four plain loads and stores (strict mode closes this); a fault in the target
+store is reported at the `fld`, and a fault or signal inside the gap sees the
+copy already stored and ST(0) not yet pushed; with all eight slots occupied
+the unfused path overwrites the slot below TOP and empties it, where this one
+leaves the stack alone (hardware raises a stack fault, which neither models);
+the empty register the temporary would have used keeps its old bits.
+
+Two properties of Rosetta shape what can fuse and were checked on
+`test_fld_gap_fstp`: it cuts a block at every 4 KiB page boundary and at a
+branch target it has already seen, so a copy spanning either is two blocks and
+simply stays unfused, and it translates code it never runs (the bytes after a
+block's end), so a "fused" log line is not proof of execution; the profile's
+per-block execution counts are (`scripts/check_gap_fuse.sh`). A computed jump
+into the middle of a gap lands in a new block that starts there, in which the
+`fstp` has no `fld` and pops its own push, which the test also covers.
+
+One failure mode is new: if the `fld` was fused and the sidecar then declines
+the `fstp`'s request (an allocation or tracee-read failure), stock would pop a
+stack the `fld` never pushed. The `fstp` request needs no emitted code, and
+the same failures already end a run of replies at a point stock cannot repair,
+but this is the first place a pair of replies depends on each other.
