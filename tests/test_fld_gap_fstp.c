@@ -32,18 +32,13 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Rosetta ends a translation block at every 4 KiB page boundary, so a function
+ * that straddles one would be two blocks and could never fuse.  Aligning the
+ * (small) case functions keeps what is fused independent of the image layout. */
+#define FN __attribute__((noinline, aligned(128)))
+
 static int failures = 0;
 static int dump_mode = 0;
-/* How many copies the hand-written cases below expect the sidecar to fuse
- * (default configuration / X87_FUSE_GAP_STRICT=1); table cases carry theirs. */
-static int hand_fuse_default = 0;
-static int hand_fuse_strict = 0;
-#define EXPECT_FUSED(DEF, STRICT)     \
-    do {                              \
-        hand_fuse_default += (DEF);   \
-        hand_fuse_strict += (STRICT); \
-    } while (0)
-
 #define FNINIT() __asm__ volatile(".byte 0xDB, 0xE3" ::: "memory")
 
 typedef struct {
@@ -172,7 +167,7 @@ typedef struct {
 #define CLOBBERS "rax", "rcx", "rdx", "r9", "xmm1", "xmm2", "xmm3", "xmm7", "memory", "cc"
 
 #define GEN(NAME, LD, ST, SRC, PRE, GAP)                                                  \
-    static __attribute__((noinline)) void NAME(void* d, const void* s) {                  \
+    static FN void NAME(void* d, const void* s) {                                         \
         __asm__ volatile(PRE_COMMON PRE LD " " SRC "\n\t" GAP "\n\t" ST " 0x30(%[d])\n\t" \
                          :                                                                \
                          : [d] "r"(d), [s] "r"(s)                                         \
@@ -229,7 +224,7 @@ GEN4A(n_aliasstore_far, "movl $0xdeadbeef, 0x80(%%r9)") /* different base: still
 
 /* the base register of the FSTP changes inside the gap */
 #define GEN_BASEWRITE(NAME, LD, ST)                                                             \
-    static __attribute__((noinline)) void NAME(void* d, const void* s) {                        \
+    static FN void NAME(void* d, const void* s) {                                               \
         void* dd = d;                                                                           \
         __asm__ volatile(PRE_COMMON LD " (%[s])\n\taddq $0x10, %[dd]\n\t" ST " 0x30(%[dd])\n\t" \
                          : [dd] "+r"(dd)                                                        \
@@ -248,11 +243,11 @@ GEN4(n_fwait, S, "", "fwait")
 GEN4(n_branch, S, "", "cmpl $5, %%ecx\n\tjz 1f\n\tmovl $1, %%edx\n1:")
 GEN4(n_branch_taken, S, "", "cmpl $0x11223344, %%ecx\n\tjz 1f\n\tmovl $1, %%edx\n1:")
 
-static __attribute__((noinline)) void nothing_helper(void) {
+static FN void nothing_helper(void) {
     __asm__ volatile("" ::: "memory");
 }
 #define GEN_CALL(NAME, LD, ST)                                                             \
-    static __attribute__((noinline)) void NAME(void* d, const void* s) {                   \
+    static FN void NAME(void* d, const void* s) {                                          \
         register void* rd __asm__("r12") = d;                                              \
         register const void* rs __asm__("r13") = s;                                        \
         __asm__ volatile(                                                                  \
@@ -270,29 +265,34 @@ GEN_CALL(n_call_d_d, "fldl", "fstpl")
 
 /* ---- state-sensitive cases (hand written) -------------------------------- */
 
-/* A jump into the middle of the gap from another path: the entry at the label
- * is its own block, in which the FSTP has no FLD. */
-static __attribute__((noinline)) void midentry(void* d, const void* s, const void* s2, int path) {
-    __asm__ volatile(PRE_COMMON
-                     "testl %[p], %[p]\n\t"
-                     "jz 3f\n\t"
-                     "flds (%[s])\n\t"
-                     "movaps %%xmm1, %%xmm2\n\t"
-                     "2:\n\t"
-                     "movaps %%xmm7, %%xmm3\n\t"
-                     "fstps 0x30(%[d])\n\t"
-                     "jmp 4f\n\t"
-                     "3:\n\t"
-                     "flds (%[s2])\n\t"
-                     "jmp 2b\n\t"
-                     "4:\n\t"
-                     :
-                     : [d] "r"(d), [s] "r"(s), [s2] "r"(s2), [p] "r"(path)
-                     : CLOBBERS);
-}
+/* A jump into the middle of the gap from another path.  `indirect` selects how
+ * path B gets there: a direct jump (Rosetta sees the target while decoding path
+ * A and cuts the block at the label, so the FLD and the FSTP are never in the
+ * same block) or a computed jump (the target is unknown when A's block is
+ * formed, so A is one block that fuses; B's entry is then a new block that
+ * starts at the label, where the FSTP has no FLD and pops its own push). */
+#define MIDENTRY(NAME, JUMP_B)                                                 \
+    static FN void NAME(void* d, const void* s, const void* s2, int path) {    \
+        __asm__ volatile(PRE_COMMON                                            \
+                         "testl %[p], %[p]\n\t"                                \
+                         "jz 3f\n\t"                                           \
+                         "flds (%[s])\n\t"                                     \
+                         "movaps %%xmm1, %%xmm2\n\t"                           \
+                         "2:\n\t"                                              \
+                         "movaps %%xmm7, %%xmm3\n\t"                           \
+                         "fstps 0x30(%[d])\n\t"                                \
+                         "jmp 4f\n\t"                                          \
+                         "3:\n\t"                                              \
+                         "flds (%[s2])\n\t" JUMP_B "4:\n\t"                    \
+                         :                                                     \
+                         : [d] "r"(d), [s] "r"(s), [s2] "r"(s2), [p] "r"(path) \
+                         : CLOBBERS, "rax");                                   \
+    }
+MIDENTRY(midentry_direct, "jmp 2b\n\t")
+MIDENTRY(midentry_indirect, "leaq 2b(%%rip), %%rax\n\tjmp *%%rax\n\t")
 
 /* Two consecutive copies, each with its own gap. */
-static __attribute__((noinline)) void two_pairs(void* d, const void* s) {
+static FN void two_pairs(void* d, const void* s) {
     __asm__ volatile(PRE_COMMON
                      "flds (%[s])\n\t"
                      "movss %%xmm1, 0x4(%[d])\n\t"
@@ -310,25 +310,25 @@ static float g_abs_src_f;
 static double g_abs_src_d;
 static float g_abs_dst_f;
 static uint32_t g_abs_other;
-static __attribute__((noinline)) void abs_gap_store_f(void) {
+static FN void abs_gap_store_f(void) {
     __asm__ volatile(PRE_COMMON "flds %[sf]\n\tmovl %%ecx, %[o]\n\tfstps %[df]\n\t"
                      : [df] "=m"(g_abs_dst_f), [o] "=m"(g_abs_other)
                      : [sf] "m"(g_abs_src_f)
                      : CLOBBERS);
 }
-static __attribute__((noinline)) void abs_gap_store_d(void) {
+static FN void abs_gap_store_d(void) {
     __asm__ volatile(PRE_COMMON "fldl %[sd]\n\tmovss %%xmm1, %[o]\n\tfstps %[df]\n\t"
                      : [df] "=m"(g_abs_dst_f), [o] "=m"(g_abs_other)
                      : [sd] "m"(g_abs_src_d)
                      : CLOBBERS);
 }
-static __attribute__((noinline)) void abs_gap_regmem(void* d) { /* different kinds: unprovable */
+static FN void abs_gap_regmem(void* d) { /* different kinds: unprovable */
     __asm__ volatile(PRE_COMMON "flds %[sf]\n\tmovl %%ecx, 0x4(%[d])\n\tfstps %[df]\n\t"
                      : [df] "=m"(g_abs_dst_f)
                      : [sf] "m"(g_abs_src_f), [d] "r"(d)
                      : CLOBBERS);
 }
-static __attribute__((noinline)) void abs_gap_overwrite(void) { /* gap stores to the target */
+static FN void abs_gap_overwrite(void) { /* gap stores to the target */
     __asm__ volatile(PRE_COMMON "flds %[sf]\n\tmovl $0x7777, %[df]\n\tfstps %[df]\n\t"
                      : [df] "=m"(g_abs_dst_f)
                      : [sf] "m"(g_abs_src_f)
@@ -578,17 +578,17 @@ static void dump_case(const test_case* c) {
 
 /* Push `depth` known values, do a fused-shape copy, check ST(0..depth-1) and the
  * state, pop them.  An integer instruction before the FLD keeps it a run start. */
-#define STACK_CASE(NAME, PUSHES, NPUSH)                                                   \
-    static __attribute__((noinline)) void NAME(void* d, const void* s, const double* v) { \
-        __asm__ volatile(PRE_COMMON PUSHES                                                \
-                         "xorl %%eax, %%eax\n\t"                                          \
-                         "flds (%[s])\n\t"                                                \
-                         "movaps %%xmm1, %%xmm2\n\t"                                      \
-                         "fstps 0x30(%[d])\n\t"                                           \
-                         "fnstenv 0x60(%[d])\n\t"                                         \
-                         :                                                                \
-                         : [d] "r"(d), [s] "r"(s), [v] "r"(v)                             \
-                         : CLOBBERS);                                                     \
+#define STACK_CASE(NAME, PUSHES, NPUSH)                            \
+    static FN void NAME(void* d, const void* s, const double* v) { \
+        __asm__ volatile(PRE_COMMON PUSHES                         \
+                         "xorl %%eax, %%eax\n\t"                   \
+                         "flds (%[s])\n\t"                         \
+                         "movaps %%xmm1, %%xmm2\n\t"               \
+                         "fstps 0x30(%[d])\n\t"                    \
+                         "fnstenv 0x60(%[d])\n\t"                  \
+                         :                                         \
+                         : [d] "r"(d), [s] "r"(s), [v] "r"(v)      \
+                         : CLOBBERS);                              \
     }
 STACK_CASE(stack1, "fldl 0(%[v])\n\t", 1)
 STACK_CASE(stack3, "fldl 0(%[v])\n\tfldl 8(%[v])\n\tfldl 16(%[v])\n\t", 3)
@@ -655,7 +655,7 @@ static void check_stack(const char* name, stack_fn fn, int depth) {
 /* Eight values already on the stack: the push overflows.  Hardware raises a
  * stack fault; neither the unfused sidecar path nor the fusion models that, so
  * this is a documented deviation and is only reported in --dump mode. */
-static __attribute__((noinline)) void overflow_copy(void* d, const void* s, const double* v) {
+static FN void overflow_copy(void* d, const void* s, const double* v) {
     __asm__ volatile(PRE_COMMON
                      "fldl 0(%[v])\n\tfldl 8(%[v])\n\tfldl 16(%[v])\n\tfldl 24(%[v])\n\t"
                      "fldl 32(%[v])\n\tfldl 40(%[v])\n\tfldl 48(%[v])\n\tfldl 56(%[v])\n\t"
@@ -775,7 +775,6 @@ static void check_two_pairs(void) {
             bad++;
         }
     }
-    EXPECT_FUSED(2, 0); /* the second FLD follows the first copy's FSTP: chained */
     if (bad) {
         printf("FAIL  two_pairs\n");
         failures++;
@@ -784,7 +783,9 @@ static void check_two_pairs(void) {
     }
 }
 
-static void check_midentry(void) {
+typedef void (*midentry_fn)(void*, const void*, const void*, int);
+
+static void check_midentry(const char* name, midentry_fn fn) {
     int bad = 0;
     const uint32_t a = f2u(1.5f);
     const uint32_t b = f2u(-7.25f);
@@ -792,11 +793,12 @@ static void check_midentry(void) {
     static uint8_t s2[16] __attribute__((aligned(16)));
     memcpy(s1, &a, 4);
     memcpy(s2, &b, 4);
-    for (int path = 0; path < 2; path++) {
+    /* path 1 (straight through) first, so its block is translated before B jumps in */
+    for (int path = 1; path >= 0; path--) {
         for (int rep = 0; rep < 3; rep++) {
             memset(bufmem, 0xA5, 64);
             FNINIT();
-            midentry(bufmem, s1, s2, path);
+            fn(bufmem, s1, s2, path);
             env_t e;
             read_env(&e);
             const uint32_t want = path ? a : b;
@@ -807,16 +809,24 @@ static void check_midentry(void) {
             }
         }
     }
-    EXPECT_FUSED(1, 1); /* path A's straight-line block holds the whole FLD...FSTP */
     if (bad) {
-        printf("FAIL  midentry\n");
+        printf("FAIL  %s\n", name);
         failures++;
     } else {
-        printf("PASS  midentry (jump into the gap from another path)\n");
+        printf("PASS  %s (jump into the gap from another path)\n", name);
     }
 }
 
-static void check_abs(void) {
+static void report(const char* name, const char* what, int bad) {
+    if (bad) {
+        printf("FAIL  %s (%d)\n", name, bad);
+        failures++;
+    } else {
+        printf("PASS  %s (%s)\n", name, what);
+    }
+}
+
+static void check_abs_store_f(void) {
     int bad = 0;
     for (int i = 0; i < N32; i++) {
         g_abs_src_f = u2f(f32_inputs[i]);
@@ -831,6 +841,11 @@ static void check_abs(void) {
             bad++;
         }
     }
+    report("abs_store_f", "rip-relative source, target and gap store", bad);
+}
+
+static void check_abs_store_d(void) {
+    int bad = 0;
     for (int i = 0; i < N64; i++) {
         g_abs_src_d = u2d(f64_inputs[i]);
         g_abs_other = 0;
@@ -843,26 +858,79 @@ static void check_abs(void) {
             bad++;
         }
     }
-    {
-        static uint8_t area[32] __attribute__((aligned(16)));
-        g_abs_src_f = 2.5f;
-        FNINIT();
-        abs_gap_regmem(area);
-        if (f2u(g_abs_dst_f) != f2u(2.5f) || *(uint32_t*)(area + 4) != 0x11223344) {
-            bad++;
-        }
-        FNINIT();
-        abs_gap_overwrite();
-        if (f2u(g_abs_dst_f) != f2u(2.5f)) { /* the FSTP lands after the gap store */
-            bad++;
-        }
+    report("abs_store_d", "rip-relative m64 source, m32 target", bad);
+}
+
+static void check_abs_regmem(void) { /* register-based gap store, absolute target: unprovable */
+    int bad = 0;
+    static uint8_t area[32] __attribute__((aligned(16)));
+    g_abs_src_f = 2.5f;
+    FNINIT();
+    abs_gap_regmem(area);
+    if (f2u(g_abs_dst_f) != f2u(2.5f) || *(uint32_t*)(area + 4) != 0x11223344) {
+        bad++;
     }
-    EXPECT_FUSED(2, 0); /* abs_gap_store_f and abs_gap_store_d; the other two are unprovable */
-    if (bad) {
-        printf("FAIL  absolute_operands (%d)\n", bad);
-        failures++;
+    report("abs_regmem", "absolute target, register-addressed gap store", bad);
+}
+
+static void check_abs_overwrite(void) { /* the gap stores to the absolute target itself */
+    int bad = 0;
+    g_abs_src_f = 2.5f;
+    FNINIT();
+    abs_gap_overwrite();
+    if (f2u(g_abs_dst_f) != f2u(2.5f)) { /* the FSTP lands after the gap store */
+        bad++;
+    }
+    report("abs_overwrite", "gap store to the target, then the FSTP", bad);
+}
+
+/* ---- groups: what `--list` and `--only` address ------------------------- */
+
+typedef struct {
+    const char* name;
+    const test_case* tc; /* table case, or NULL */
+    void (*fn)(void);    /* hand-written group when tc is NULL */
+    int fuse_default;    /* copies the sidecar should fuse in this group, default config */
+    int fuse_strict;     /* ... with X87_FUSE_GAP_STRICT=1 */
+} group_t;
+
+static void g_stack1(void) {
+    check_stack("stack1", stack1, 1);
+}
+static void g_stack3(void) {
+    check_stack("stack3", stack3, 3);
+}
+static void g_stack7(void) {
+    check_stack("stack7", stack7, 7);
+}
+
+static void g_midentry_direct(void) {
+    check_midentry("midentry_direct", midentry_direct);
+}
+static void g_midentry_indirect(void) {
+    check_midentry("midentry_indirect", midentry_indirect);
+}
+
+static const group_t hand_groups[] = {
+    {"stack1", NULL, g_stack1, 1, 1},
+    {"stack3", NULL, g_stack3, 1, 1},
+    {"stack7", NULL, g_stack7, 1, 1},
+    {"non_copies", NULL, check_non_copies, 0, 0},
+    {"two_pairs", NULL, check_two_pairs, 2, 0}, /* the second FLD follows the first FSTP: chained */
+    {"midentry_direct", NULL, g_midentry_direct, 0, 0},     /* block cut at the label */
+    {"midentry_indirect", NULL, g_midentry_indirect, 1, 1}, /* path A's block holds both */
+    {"abs_store_f", NULL, check_abs_store_f, 1, 0},
+    {"abs_store_d", NULL, check_abs_store_d, 1, 0},
+    {"abs_regmem", NULL, check_abs_regmem, 0, 0},
+    {"abs_overwrite", NULL, check_abs_overwrite, 0, 0},
+};
+#define NHAND ((int)(sizeof(hand_groups) / sizeof(hand_groups[0])))
+
+static void run_group(const group_t* g) {
+    if (g->tc) {
+        check_case(g->tc);
     } else {
-        printf("PASS  absolute_operands (rip-relative source, target and gap)\n");
+        g->fn();
     }
 }
 
@@ -870,10 +938,27 @@ int main(int argc, char** argv) {
     /* The sidecar writes its own diagnostics to the same stdout: one write per
      * line keeps them from landing in the middle of ours. */
     setvbuf(stdout, NULL, _IOLBF, 0);
+    const char* only = NULL;
+    int list = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump") == 0) {
             dump_mode = 1;
+        } else if (strcmp(argv[i], "--list") == 0) {
+            list = 1;
+        } else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
+            only = argv[++i];
         }
+    }
+
+    if (list) { /* one line per group: name, copies expected fused (default, strict) */
+        for (int i = 0; i < NCASES; i++) {
+            printf("GROUP %s %d %d\n", cases[i].name, cases[i].fuse_default, cases[i].fuse_strict);
+        }
+        for (int i = 0; i < NHAND; i++) {
+            printf("GROUP %s %d %d\n", hand_groups[i].name, hand_groups[i].fuse_default,
+                   hand_groups[i].fuse_strict);
+        }
+        return 0;
     }
 
     if (dump_mode) {
@@ -902,23 +987,24 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    int expect_default = 0;
-    int expect_strict = 0;
+    int ran = 0;
     for (int i = 0; i < NCASES; i++) {
-        check_case(&cases[i]);
-        expect_default += cases[i].fuse_default;
-        expect_strict += cases[i].fuse_strict;
+        if (only == NULL || strcmp(only, cases[i].name) == 0) {
+            const group_t g = {cases[i].name, &cases[i], NULL, 0, 0};
+            run_group(&g);
+            ran++;
+        }
     }
-    check_stack("stack1", stack1, 1);
-    check_stack("stack3", stack3, 3);
-    check_stack("stack7", stack7, 7);
-    EXPECT_FUSED(3, 3);
-    check_non_copies();
-    check_two_pairs();
-    check_midentry();
-    check_abs();
-    printf("GAPFUSE_EXPECT default=%d strict=%d\n", expect_default + hand_fuse_default,
-           expect_strict + hand_fuse_strict);
+    for (int i = 0; i < NHAND; i++) {
+        if (only == NULL || strcmp(only, hand_groups[i].name) == 0) {
+            run_group(&hand_groups[i]);
+            ran++;
+        }
+    }
+    if (ran == 0) {
+        printf("FAIL  no group named %s\n", only);
+        return 1;
+    }
     printf("%s\n", failures ? "SOME FAILED" : "ALL PASS");
     return failures ? 1 : 0;
 }
