@@ -37,6 +37,7 @@ constexpr FusionEntry kFusionTable[] = {
     {.name = "arith_fstp", .id = FusionId::arith_fstp},
     {.name = "arith_faddp", .id = FusionId::arith_faddp},
     {.name = "fstp_arith_fstp", .id = FusionId::fstp_arith_fstp},
+    {.name = "fld_gap_fstp", .id = FusionId::fld_gap_fstp},
 };
 
 }  // namespace
@@ -178,6 +179,8 @@ RosettaConfig load_config_from_env() {
     cfg.bridge_max_gap = 2;
     cfg.bridge_max_total = 8;
     cfg.log_bridge = env_truthy("X87_LOG_BRIDGE") ? 1 : 0;
+    cfg.fuse_gap_strict = env_truthy("X87_FUSE_GAP_STRICT") ? 1 : 0;
+    cfg.log_gap_fuse = env_truthy("X87_LOG_GAP_FUSE") ? 1 : 0;
     auto parse_bridge_bound = [](const char* env_name, uint8_t& target, long lo, long hi) {
         const char* t = std::getenv(env_name);
         if (t == nullptr || t[0] == '\0') {
@@ -464,6 +467,15 @@ void print_env_help(std::FILE* out) {
         "  X87_BRIDGE_MAX_TOTAL=N        [1,16] default 8: max bridge instructions\n"
         "                                per bridged region\n"
         "  X87_LOG_BRIDGE=1              one stderr line per bridged compile/fallback\n"
+        "  X87_LOG_GAP_FUSE=1            one stderr line per fld_gap_fstp copy fused\n"
+        "  X87_FUSE_GAP_STRICT=1         fld_gap_fstp (see X87_DISABLE_FUSIONS): only\n"
+        "                                fuse an FLD m32/m64 ... FSTP m32/m64 copy when\n"
+        "                                the <=4 instructions between them touch no\n"
+        "                                memory.  Default OFF: they may also load/store\n"
+        "                                memory provably disjoint from the FSTP target\n"
+        "                                (same base/index registers, non-overlapping\n"
+        "                                displacement); the target store then becomes\n"
+        "                                visible before them\n"
         "  X87_BRIDGE_HASH_LIST=H,...    bridge ONLY blocks whose IR-content hash is\n"
         "                                listed (bisect aid; hash from X87_LOG_BRIDGE\n"
         "                                or profile_analyze)\n"

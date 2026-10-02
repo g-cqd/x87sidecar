@@ -20,6 +20,7 @@
 #include "rosetta_core/TranslatorX87.h"
 #include "rosetta_core/TranslatorX87F80.hpp"
 #include "rosetta_core/TranslatorX87Fusion.h"
+#include "rosetta_core/TranslatorX87GapFuse.h"
 #include "rosetta_core/TranslatorX87Helpers.hpp"
 #include "rosetta_core/X87Cache.h"
 #include "rosetta_core/X87IR.h"
@@ -40,8 +41,8 @@ static bool is_x87_opcode(uint16_t op) {
 // translate_instruction wraps it so the reply's frontier (last_next_idx) is
 // recorded once, after every exit path, and so that a run is one reply.
 static auto translate_instruction_impl(TranslationResult* translation_result, IRBlock* block,
-                                       IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx)
-    -> std::optional<int64_t>;
+                                       IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
+                                       TranslatorX87::GapFuse gap = {}) -> std::optional<int64_t>;
 
 // Flush every deferred piece of x87 state to memory and release the run.
 // Only for the path that must not happen: an instruction inside a run the
@@ -66,13 +67,17 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     auto& cache = translation_result->x87_cache;
     const auto start = translation_result->insn_buf.end;
     const auto op = instr_array[insn_idx].opcode();
+    // fld_gap_fstp: the FLD's reply does the whole copy and the FSTP's reply is
+    // empty.  Neither touches the x87 state, so neither needs the boundary.
+    const TranslatorX87::GapFuse gap = TranslatorX87::classify_gap_fuse(
+        *translation_result, block, instr_array, num_instrs, insn_idx);
     // Metadata-only ops and FXSAVE/FXRSTOR go to stock, which consumes
     // native state directly. Every handled x87 reply uses compact state
     // internally and must export native f80 after its cache is flushed.
-    const bool native_boundary = is_x87_opcode(op) && op != kOpcodeName_fclex &&
-                                 op != kOpcodeName_finit && op != kOpcodeName_fldenv &&
-                                 op != kOpcodeName_fstenv && op != kOpcodeName_fxsave &&
-                                 op != kOpcodeName_fxrstor;
+    const bool native_boundary =
+        gap.kind == TranslatorX87::GapFuseKind::kNone && is_x87_opcode(op) &&
+        op != kOpcodeName_fclex && op != kOpcodeName_finit && op != kOpcodeName_fldenv &&
+        op != kOpcodeName_fstenv && op != kOpcodeName_fxsave && op != kOpcodeName_fxrstor;
     const bool traced =
         native_boundary && x87trace::matches(instr_array, static_cast<size_t>(num_instrs));
     const uint64_t trace_site = uint64_t(instr_array[insn_idx].pc) << 32;
@@ -80,8 +85,8 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         x87trace::emit_boundary(*translation_result, trace_site | (uint64_t(insn_idx) << 1));
     if (native_boundary)
         TranslatorX87::emit_native_state_boundary(*translation_result, true);
-    auto ret =
-        translate_instruction_impl(translation_result, block, instr_array, num_instrs, insn_idx);
+    auto ret = translate_instruction_impl(translation_result, block, instr_array, num_instrs,
+                                          insn_idx, gap);
 
     // A run is one reply.  Stock records one instruction-map entry per
     // translate_insn reply, and when an asynchronous signal lands in a
@@ -126,8 +131,8 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
 }
 
 static auto translate_instruction_impl(TranslationResult* translation_result, IRBlock* block,
-                                       IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx)
-    -> std::optional<int64_t> {
+                                       IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
+                                       TranslatorX87::GapFuse gap) -> std::optional<int64_t> {
     auto* const cur_instr = &instr_array[insn_idx];
     const auto opcode = cur_instr->opcode();
     auto& cache = translation_result->x87_cache;
@@ -253,7 +258,7 @@ static auto translate_instruction_impl(TranslationResult* translation_result, IR
             translation_result->free_gpr_mask &= kGprScratchMask;
         }
         cache.last_insn_idx = static_cast<int32_t>(insn_idx);
-        if (!cache.active()) {
+        if (!cache.active() && gap.kind == TranslatorX87::GapFuseKind::kNone) {
             const bool cache_disabled = g_rosetta_config && g_rosetta_config->disable_x87_cache;
             if (!cache_disabled) {
                 const int run = X87Cache::lookahead(instr_array, num_instrs, insn_idx);
@@ -387,6 +392,43 @@ static auto translate_instruction_impl(TranslationResult* translation_result, IR
         }
         return true;
     };
+
+    // ── fld_gap_fstp: FLD m + <=4 independent non-x87 insns + FSTP m ────────
+    // The head request emits the whole copy and records the FSTP's index; the
+    // FSTP's request then emits nothing (an adjacent pair is one request that
+    // consumes both).  Both are fresh run starts: the classifier insists on it,
+    // and arming a run above is skipped for them, so no cached or deferred
+    // state exists.  The wrapper in translate_instruction also leaves out the
+    // native-state boundary: the x87 state is neither read nor written.
+    if (gap.kind != TranslatorX87::GapFuseKind::kNone) {
+        cache.invalidate();
+        int consumed = 1;
+        if (gap.kind == TranslatorX87::GapFuseKind::kHead) {
+            TranslatorX87::emit_gap_copy(*translation_result, cur_instr,
+                                         &instr_array[gap.tail_idx]);
+            if (gap.tail_idx == insn_idx + 1) {
+                consumed = 2;  // adjacent FLD;FSTP: both consumed here, nothing pending
+            } else {
+                cache.gap_tail_block = block;
+                cache.gap_tail_idx = static_cast<int32_t>(gap.tail_idx);
+                cache.gap_head_idx = static_cast<int32_t>(insn_idx);
+            }
+            if (g_rosetta_config != nullptr && g_rosetta_config->log_gap_fuse != 0) {
+                std::fprintf(stderr, "[x87-gapfuse] fused hash=0x%016llx fld=%lld fstp=%lld\n",
+                             static_cast<unsigned long long>(cache.profile_hash),
+                             static_cast<long long>(insn_idx),
+                             static_cast<long long>(gap.tail_idx));
+            }
+            translation_result->free_fpr_mask =
+                translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
+            translation_result->_pinned_temporary_scalars = 0;
+        }
+        cache.tally_peep = static_cast<uint16_t>(cache.tally_peep + consumed);
+        mirror_tally();
+        translation_result->free_gpr_mask = cache.stock_free_gpr_mask;
+        cache.prev_x87_opcode = opcode;
+        return insn_idx + consumed;
+    }
 
     // ── IR pipeline: try whole-run optimization for runs of 3+ ─────────────
     // The IR fires once at the start of a fresh run (no deferred cache state).

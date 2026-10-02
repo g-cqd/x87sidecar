@@ -145,6 +145,9 @@ void X87Cache::invalidate() {
     tag_push_pending = 0;
     deferred_pop_count = 0;
     run_remaining = 0;
+    gap_tail_block = nullptr;
+    gap_tail_idx = -1;
+    gap_head_idx = -1;
     reset_perm();
 }
 

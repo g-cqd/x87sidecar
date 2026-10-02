@@ -59,6 +59,15 @@ struct X87Cache {
 
     IRBlock* prev_block = nullptr;
 
+    // fld_gap_fstp: the FLD at gap_head_idx did the whole copy, so the FSTP at
+    // gap_tail_idx of gap_tail_block must emit nothing.  Set by the FLD's
+    // reply, consumed by the FSTP's; cleared with the rest of the cache on a
+    // block change, a restart or any fallback to stock, so a FLD that stock
+    // translated itself never leaves a stale record behind.
+    IRBlock* gap_tail_block = nullptr;
+    int32_t gap_tail_idx = -1;
+    int32_t gap_head_idx = -1;
+
     // Stock's free_gpr_mask word as it arrived at the current x87 entry
     // (run start or isolated op).  Stock's translate_insn carries its
     // register-allocator state across a block in this TR field; every
