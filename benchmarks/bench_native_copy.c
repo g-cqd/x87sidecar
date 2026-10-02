@@ -18,34 +18,37 @@ static float dst[64] __attribute__((aligned(64)));
 
 static __attribute__((noinline)) void p_fc2(float* d, const float* s, long n) {
     for (long i = 0; i < n; i++)
-        __asm__ volatile("str s7, [%0, #0x20]\n\t"
-                         "ldr s0, [%1]\n\t"
-                         "str s1, [%0, #4]\n\t"
-                         "str s0, [%0, #0x30]\n"
-                         :
-                         : "r"(d), "r"(s)
-                         : "memory", "v0");
+        __asm__ volatile(
+            "str s7, [%0, #0x20]\n\t"
+            "ldr s0, [%1]\n\t"
+            "str s1, [%0, #4]\n\t"
+            "str s0, [%0, #0x30]\n"
+            :
+            : "r"(d), "r"(s)
+            : "memory", "v0");
 }
 
 static __attribute__((noinline)) void p_chain(float* d, const float* s, long n) {
     (void)s;
     d[12] = src[0];
     for (long i = 0; i < n; i++)
-        __asm__ volatile("ldr s0, [%0, #0x30]\n\t"
-                         "str s1, [%0, #4]\n\t"
-                         "str s0, [%0, #0x30]\n"
-                         :
-                         : "r"(d)
-                         : "memory", "v0");
+        __asm__ volatile(
+            "ldr s0, [%0, #0x30]\n\t"
+            "str s1, [%0, #4]\n\t"
+            "str s0, [%0, #0x30]\n"
+            :
+            : "r"(d)
+            : "memory", "v0");
 }
 
 static __attribute__((noinline)) void p_pair(float* d, const float* s, long n) {
     for (long i = 0; i < n; i++)
-        __asm__ volatile("ldr s0, [%1]\n\t"
-                         "str s0, [%0, #0x30]\n"
-                         :
-                         : "r"(d), "r"(s)
-                         : "memory", "v0");
+        __asm__ volatile(
+            "ldr s0, [%1]\n\t"
+            "str s0, [%0, #0x30]\n"
+            :
+            : "r"(d), "r"(s)
+            : "memory", "v0");
 }
 
 static __attribute__((noinline)) void p_loop(float* d, const float* s, long n) {

@@ -24,24 +24,26 @@ static double ddst[64] __attribute__((aligned(64)));
 
 static __attribute__((noinline)) void p_fc2(float* d, const float* s, long n) {
     for (long i = 0; i < n; i++)
-        __asm__ volatile("movss %%xmm7, 0x20(%0)\n\t"
-                         "flds (%1)\n\t"
-                         "movss %%xmm1, 0x4(%0)\n\t"
-                         "fstps 0x30(%0)\n"
-                         :
-                         : "r"(d), "r"(s)
-                         : "memory", "xmm1", "xmm7");
+        __asm__ volatile(
+            "movss %%xmm7, 0x20(%0)\n\t"
+            "flds (%1)\n\t"
+            "movss %%xmm1, 0x4(%0)\n\t"
+            "fstps 0x30(%0)\n"
+            :
+            : "r"(d), "r"(s)
+            : "memory", "xmm1", "xmm7");
 }
 
 static __attribute__((noinline)) void p_fc2_d(double* d, const double* s, long n) {
     for (long i = 0; i < n; i++)
-        __asm__ volatile("movss %%xmm7, 0x20(%0)\n\t"
-                         "fldl (%1)\n\t"
-                         "movss %%xmm1, 0x4(%0)\n\t"
-                         "fstpl 0x30(%0)\n"
-                         :
-                         : "r"(d), "r"(s)
-                         : "memory", "xmm1", "xmm7");
+        __asm__ volatile(
+            "movss %%xmm7, 0x20(%0)\n\t"
+            "fldl (%1)\n\t"
+            "movss %%xmm1, 0x4(%0)\n\t"
+            "fstpl 0x30(%0)\n"
+            :
+            : "r"(d), "r"(s)
+            : "memory", "xmm1", "xmm7");
 }
 
 /* Same shape with three values live on the x87 stack for the whole loop: every
@@ -50,13 +52,14 @@ static __attribute__((noinline)) void p_fc2_live3(float* d, const float* s, long
     static const double v[3] = {11.5, 22.5, 33.5};
     __asm__ volatile("fldl 0(%0)\n\tfldl 8(%0)\n\tfldl 16(%0)\n" : : "r"(v) : "memory");
     for (long i = 0; i < n; i++)
-        __asm__ volatile("movss %%xmm7, 0x20(%0)\n\t"
-                         "flds (%1)\n\t"
-                         "movss %%xmm1, 0x4(%0)\n\t"
-                         "fstps 0x30(%0)\n"
-                         :
-                         : "r"(d), "r"(s)
-                         : "memory", "xmm1", "xmm7");
+        __asm__ volatile(
+            "movss %%xmm7, 0x20(%0)\n\t"
+            "flds (%1)\n\t"
+            "movss %%xmm1, 0x4(%0)\n\t"
+            "fstps 0x30(%0)\n"
+            :
+            : "r"(d), "r"(s)
+            : "memory", "xmm1", "xmm7");
     __asm__ volatile("fstp %%st(0)\n\tfstp %%st(0)\n\tfstp %%st(0)\n" : : : "memory");
 }
 
@@ -67,32 +70,35 @@ static __attribute__((noinline)) void p_chain(float* d, const float* s, long n) 
     (void)s;
     d[12] = src[0];
     for (long i = 0; i < n; i++)
-        __asm__ volatile("flds 0x30(%0)\n\t"
-                         "movss %%xmm1, 0x4(%0)\n\t"
-                         "fstps 0x30(%0)\n"
-                         :
-                         : "r"(d)
-                         : "memory", "xmm1");
+        __asm__ volatile(
+            "flds 0x30(%0)\n\t"
+            "movss %%xmm1, 0x4(%0)\n\t"
+            "fstps 0x30(%0)\n"
+            :
+            : "r"(d)
+            : "memory", "xmm1");
 }
 
 static __attribute__((noinline)) void p_pair(float* d, const float* s, long n) {
     for (long i = 0; i < n; i++)
-        __asm__ volatile("flds (%1)\n\t"
-                         "fstps 0x30(%0)\n"
-                         :
-                         : "r"(d), "r"(s)
-                         : "memory");
+        __asm__ volatile(
+            "flds (%1)\n\t"
+            "fstps 0x30(%0)\n"
+            :
+            : "r"(d), "r"(s)
+            : "memory");
 }
 
 static __attribute__((noinline)) void p_sse(float* d, const float* s, long n) {
     for (long i = 0; i < n; i++)
-        __asm__ volatile("movss %%xmm7, 0x20(%0)\n\t"
-                         "movss (%1), %%xmm0\n\t"
-                         "movss %%xmm1, 0x4(%0)\n\t"
-                         "movss %%xmm0, 0x30(%0)\n"
-                         :
-                         : "r"(d), "r"(s)
-                         : "memory", "xmm0", "xmm1", "xmm7");
+        __asm__ volatile(
+            "movss %%xmm7, 0x20(%0)\n\t"
+            "movss (%1), %%xmm0\n\t"
+            "movss %%xmm1, 0x4(%0)\n\t"
+            "movss %%xmm0, 0x30(%0)\n"
+            :
+            : "r"(d), "r"(s)
+            : "memory", "xmm0", "xmm1", "xmm7");
 }
 
 static __attribute__((noinline)) void p_loop(float* d, const float* s, long n) {
