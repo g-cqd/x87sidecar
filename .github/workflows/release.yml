@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -36,7 +36,7 @@ jobs:
           tar --xz -cf x87sidecar_entitled.tar.xz -C build/bin x87sidecar_entitled
 
       - name: Create draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: x87sidecar ${{ github.ref_name }}
