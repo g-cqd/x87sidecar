@@ -16,6 +16,7 @@ add_x86_sample(bench_unary)
 add_x86_sample(bench_fcmov)
 add_x86_sample(bench_fusion_fld_arithp)
 add_x86_sample(bench_fusion_fld_fstp)
+add_x86_sample(bench_fld_gap_fstp)
 add_x86_sample(bench_single_op)
 add_x86_sample(bench_fusion_fld_arith_fstp)
 add_x86_sample(bench_fusion_fld_fcomp_fstsw)
@@ -66,5 +67,9 @@ add_x86_sample(bench_fyl2x)
 add_x86_sample(bench_fyl2xp1)
 add_x86_sample(bench_fprem)
 add_x86_sample(bench_fprem1)
+
+# Native arm64 reference for bench_fld_gap_fstp (host build, run directly).
+add_executable(bench_native_copy bench_native_copy.c)
+target_include_directories(bench_native_copy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_subdirectory(macro)
