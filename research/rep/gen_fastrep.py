@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Generates the candidate AArch64 shape for a fast rep movs/stos (assembly text) for shape
-experiments: python3 gen_fastrep.py <movs|stos> <1|2|4|8> <a32|a64> [--stock]
-Own code only. Registers: guest rax=x0 rcx=x1 rsi=x6 rdi=x7, DF in x17 bit1, scratch x22..x29, v24..v31."""
+"""REJECTED CANDIDATE (kept as evidence): generates a fast rep movs/stos shape with a size-dispatched
+straight-line copy in the prefix before the stock element loop. The runtime classifier rejects it
+(stores before the loop start count as architectural state modification; see shapes/A_prefix_store.s).
+usage: gen_fastrep.py <movs|stos> <1|2|4|8> <a32|a64> [--stock] [--noret]"""
 import sys
 
 def gen(kind, e, a32, stock=False, capbytes=256, noret=False):
