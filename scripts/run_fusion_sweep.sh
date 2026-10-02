@@ -67,10 +67,11 @@ ALL_FUSIONS=(
     fstp_fld
     arith_fstp
     arith_faddp
+    fld_gap_fstp
 )
 
 # Tests that exercise fusion patterns
-FUSION_TESTS=(test_peephole3 test_peephole4 test_peephole5 test_peephole6 test_peephole7 test_peephole8 test_peephole test_arith test_fcomp_mem test_x87_full test_arith_faddp)
+FUSION_TESTS=(test_peephole3 test_peephole4 test_peephole5 test_peephole6 test_peephole7 test_peephole8 test_peephole test_arith test_fcomp_mem test_x87_full test_arith_faddp test_fld_gap_fstp)
 
 # Colors
 RED='\033[0;31m'

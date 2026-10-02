@@ -27,6 +27,8 @@ enum class FusionId : int {
     arith_fstp,       // non-popping ARITH + FSTP mem (2-instruction, skip intermediate stack store)
     arith_faddp,      // FMUL + FADDP/FSUBP/FSUBRP → FMADD/FMSUB/FNMSUB (FMA fusion)
     fstp_arith_fstp,  // FSTP mem + non-popping ARITH mem + FSTP mem (3-instruction, batched 2-pop)
+    fld_gap_fstp,     // FLD m32/m64 + up to 4 independent non-x87 insns + FSTP m32/m64: the copy is
+                      // done at the FLD, the FSTP becomes a no-op (net-zero stack, no state RMW)
     kCount
 };
 
@@ -109,6 +111,19 @@ struct RosettaConfig {
                                       //                           gap.
     uint8_t bridge_max_total;         // X87_BRIDGE_MAX_TOTAL      [1,16], default 8: max bridge
                                       //                           instrs per region.
+    uint8_t fuse_gap_strict;          // X87_FUSE_GAP_STRICT       (default OFF) fld_gap_fstp: only
+                                      //                           fuse when the instructions
+                                      //                           between the FLD and the FSTP
+                                      //                           touch no memory at all.  Off
+                                      //                           also allows loads/stores that
+                                      //                           are provably disjoint from the
+                                      //                           FSTP target (same base/index,
+                                      //                           non-overlapping displacement),
+                                      //                           which makes the target store
+                                      //                           visible before them.
+    uint8_t log_gap_fuse;             // X87_LOG_GAP_FUSE          one stderr line per fld_gap_fstp
+                                      //                           copy fused (block hash, FLD and
+                                      //                           FSTP index).
     uint8_t log_bridge;               // X87_LOG_BRIDGE            one stderr line per bridged
                                       //                           compile (hash, counts) and per
                                       //                           fallback.
