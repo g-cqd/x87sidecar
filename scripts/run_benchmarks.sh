@@ -36,6 +36,7 @@ ALL_BENCHMARKS=(
     bench_fcmov
     bench_fusion_fld_arithp
     bench_fusion_fld_fstp
+    bench_fld_gap_fstp
     bench_fusion_fld_arith_fstp
     bench_fusion_fld_fcomp_fstsw
     bench_fusion_fxch_arithp
