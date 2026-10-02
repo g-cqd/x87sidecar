@@ -77,6 +77,7 @@ ALL_TESTS=(
     test_deep_stack
     test_single_op
     test_fld_gap_fstp
+    test_fld_gap_fstp_a32
     test_x87_full
     test_fstpt
     test_fxam
