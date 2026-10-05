@@ -252,13 +252,51 @@ invalidates them from its own thread: a cooperative attach happens after
 Rosetta init, when `translate_insn` is already hot in the instruction cache
 and a cross-process flush is not reliable.
 
+When the hook cannot be set up, the two modes differ. The default attach
+refuses to launch the target, so a test or benchmark run never reports
+results that were not hooked. Cooperative mode, which wine sends every
+32-bit process through, lets the program run when hook setup fails. A
+failure before launch, such as an unsupported Rosetta or a sidecar that
+could not start, execs the target in place, keeping its pid, with the
+arguments and environment wine passed: `X87_SIDECAR_BOOTSTRAP` is not set
+for it and `ROSETTA_DISABLE_AOT` keeps whatever value it inherited. A
+failure after the target has handed over its ports, by an error or an
+exception, puts back any entry patch already written and releases the
+target without the hook.
+
+Either way a program running without the hook is easy to miss, since the
+only symptom is that an x87-heavy game is slow. So both paths print a
+banner on stderr:
+
+```
+################################################################
+WARNING: X87SIDECAR COULD NOT HOOK ROSETTA: UNSUPPORTED ROSETTA.
+PROCESS 12345 IS RUNNING WITHOUT X87 ACCELERATION: /path/to/wine
+32-BIT GAMES THAT USE X87 MATH WILL BE MUCH SLOWER.
+################################################################
+```
+
+The reason on the second line varies; the substring `RUNNING WITHOUT X87
+ACCELERATION` does not, so logs can be searched for it. A sidecar that
+gives up before the target's handshake request arrived, when the target
+may not be running at all, prints `x87 hook not installed for <program>`
+instead.
+
+Two switches exercise these paths. `X87_FORCE_UNSUPPORTED=1` makes the
+loader treat the installed Rosetta as unsupported. `X87_FORCE_ABANDON` makes
+the sidecar give up after hooking: `entry` after the `translate_insn` entry
+patch, `decode` after the `decode_opcode` step, `thread` with an exception
+where the receive thread is spawned. `scripts/test_unhooked_fallback.py`
+checks the first without privileges.
+
 ## Compatibility and correctness
 
 Nothing in the tree is tied to a macOS or Rosetta build number. At startup
 the loader locates what it patches by anchors that survive a rebuild, checks
 the assumptions the emitted code relies on against the installed runtime,
 and refuses a runtime that fails a check rather than patching guessed
-addresses. `x87sidecar --probe` prints that report and exits 0 only when
+addresses; [Attaching](#attaching-to-the-target) says what then happens to
+the program. `x87sidecar --probe` prints that report and exits 0 only when
 every feature is supported; run it first after a macOS update. CI runs it
 on the current `macos-26` runner before the test suite, and it runs on
 macOS 27.
@@ -315,6 +353,7 @@ bash scripts/run_tests.sh --no-build     # skip the build
 bash scripts/run_tests.sh --native-only  # stock Rosetta baseline only
 bash scripts/run_tests.sh test_arith     # one test
 python3 scripts/test_profile_paths.py    # concurrent profiler output paths
+python3 scripts/test_unhooked_fallback.py  # unhooked fallback, no privileges
 bash scripts/run_benchmarks.sh           # build + benchmark table
 ```
 
@@ -394,6 +433,8 @@ Loader and sidecar diagnostics:
 | `X87_LOG_OPS=1` | one line per translated op; high volume, for freeze bisects |
 | `X87_NO_IR_CACHE=1`, `X87_NO_TCO_CACHE=1` | re-read the IR array or the thread-context layout on every request |
 | `X87_NO_PREAUTH=1` | skip acquiring the developer-tools right before launch (default attach only) |
+| `X87_FORCE_UNSUPPORTED=1` | treat the installed Rosetta as unsupported at launch; a cooperative target then runs without the hook |
+| `X87_FORCE_ABANDON=entry\|decode\|thread` | give up after the named hook step; a cooperative target is rolled back and runs without the hook |
 
 ## License
 
