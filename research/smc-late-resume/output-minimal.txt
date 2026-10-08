@@ -1,37 +1,49 @@
 $ clang -arch x86_64 -O1 -Wall -o rosetta_smc rosetta_smc.c
-$ ./rosetta_smc 
-running translated by Rosetta: yes
-rounds=2000 ok=0 faulted=2000
-first fault: rip = page+0x14 (cpuid starts at page+0x13), si_addr=0xc35b
-(exit 1)
-$ ./rosetta_smc 0 1
-running translated by Rosetta: yes
-rounds=2000 ok=0 faulted=2000
-first fault: rip = page+0x14 (cpuid starts at page+0x13), si_addr=0xc35b
-(exit 1)
-$ ./rosetta_smc 1
-running translated by Rosetta: yes
-rounds=2000 ok=0 faulted=2000
-first fault: rip = page+0x15 (cpuid starts at page+0x14), si_addr=0xc35b
-(exit 1)
-$ ./rosetta_smc 8
-running translated by Rosetta: yes
-rounds=2000 ok=0 faulted=2000
-first fault: rip = page+0x1c (cpuid starts at page+0x1b), si_addr=0xc35b
-(exit 1)
-$ ./rosetta_smc 64
-running translated by Rosetta: yes
-rounds=2000 ok=0 faulted=2000
-first fault: rip = page+0x54 (cpuid starts at page+0x53), si_addr=0xc35b
-(exit 1)
-$ ./rosetta_smc 0 0 1
+$ ./rosetta_smc    # two stores (the NFS16 pattern)
 running translated by Rosetta: yes
 rounds=2000 ok=0 faulted=2000
 first fault: rip = page+0x14 (cpuid starts at page+0x13), si_addr=0xc35b
 (exit 1)
 
+$ ./rosetta_smc 0 1   # control: ONE store of 0F A2 instead of two
+running translated by Rosetta: yes
+rounds=2000 ok=2000 faulted=0
+(exit 0)
+
+$ ./rosetta_smc 8 1   # control: one store, 8 NOP gap
+running translated by Rosetta: yes
+rounds=2000 ok=2000 faulted=0
+(exit 0)
+
+$ ./rosetta_smc 1   # 1 NOP between the stores and the built instruction
+running translated by Rosetta: yes
+rounds=2000 ok=0 faulted=2000
+first fault: rip = page+0x15 (cpuid starts at page+0x14), si_addr=0xc35b
+(exit 1)
+
+$ ./rosetta_smc 8   # 8 NOPs
+running translated by Rosetta: yes
+rounds=2000 ok=0 faulted=2000
+first fault: rip = page+0x1c (cpuid starts at page+0x1b), si_addr=0xc35b
+(exit 1)
+
+$ ./rosetta_smc 64   # 64 NOPs
+running translated by Rosetta: yes
+rounds=2000 ok=0 faulted=2000
+first fault: rip = page+0x54 (cpuid starts at page+0x53), si_addr=0xc35b
+(exit 1)
+
+$ ./rosetta_smc 0 0 1   # a single round in a fresh process
+running translated by Rosetta: yes
+rounds=1 ok=0 faulted=1
+first fault: rip = page+0x14 (cpuid starts at page+0x13), si_addr=0xc35b
+(exit 1)
+
+$ sw_vers
 ProductName:		macOS
 ProductVersion:		27.2
 BuildVersion:		26B5091g
+
+$ sysctl -n hw.model machdep.cpu.brand_string
 MacBookPro17,1
 Apple M1
