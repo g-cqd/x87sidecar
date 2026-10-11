@@ -154,8 +154,16 @@ struct X87Cache {
     void reset_perm();
     bool perm_is_identity() const;
 
-    // Scan forward from insn_idx counting consecutive handled x87 instructions.
-    static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx);
+    // Scratch FPRs the single-instruction translator of `op` holds at once,
+    // at its peak.  0 for opcodes it does not handle.
+    static int single_op_fpr_need(uint16_t op);
+
+    // Scan forward from insn_idx counting consecutive handled x87
+    // instructions.  The run also stops before an instruction whose
+    // single_op_fpr_need exceeds fpr_pool (the scratch FPRs stock leaves
+    // free), so it ends with a normal x87_end and stock gets that one.
+    static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
+                         int fpr_pool = 32);
 
     // Run bridging: a region descriptor for one IR run that spans short gaps
     // of bridge instructions (X87Bridge.h) between x87 segments.

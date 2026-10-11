@@ -198,10 +198,92 @@ uint32_t X87Cache::pinned_mask() const {
     return mask;
 }
 
-int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx) {
+// Peak scratch FPRs held by each single-instruction translator.  The
+// transcendental values are the documented straight-line peaks of their
+// emitters (TranslatorX87Transcendental.cpp), which do not depend on the
+// operands.  The rest are the largest peaks measured over every test binary
+// under the default, IR-off, IR-off + no-fusions and IR-off + no-single-fast
+// configurations.  An operand form that needs more than its entry still
+// cannot abort: alloc_free_fpr throws RegisterPoolExhausted and the sidecar
+// hands the instruction to stock.
+int X87Cache::single_op_fpr_need(uint16_t op) {
+    switch (op) {
+        case kOpcodeName_fsincos:  // two trig bodies, one value held across each
+        case kOpcodeName_fptan:
+        case kOpcodeName_fyl2x:
+        case kOpcodeName_fyl2xp1:
+            return 8;
+        case kOpcodeName_fsin:  // range reduction + order-6 Estrin polynomial
+        case kOpcodeName_fcos:
+            return 7;
+        case kOpcodeName_fpatan:
+        case kOpcodeName_f2xm1:
+            return 6;
+        case kOpcodeName_fxtract:
+        case kOpcodeName_fbstp:
+            return 5;
+        case kOpcodeName_faddp:
+        case kOpcodeName_fsubp:
+        case kOpcodeName_fsubrp:
+        case kOpcodeName_fmulp:
+        case kOpcodeName_fdivp:
+        case kOpcodeName_fdivrp:
+        case kOpcodeName_fscale:
+            return 4;
+        case kOpcodeName_fld1:
+        case kOpcodeName_fstp:
+        case kOpcodeName_fstp_stack:
+        case kOpcodeName_fprem:
+        case kOpcodeName_fprem1:
+            return 3;
+        case kOpcodeName_fadd:
+        case kOpcodeName_fiadd:
+        case kOpcodeName_fsub:
+        case kOpcodeName_fsubr:
+        case kOpcodeName_fisub:
+        case kOpcodeName_fisubr:
+        case kOpcodeName_fmul:
+        case kOpcodeName_fimul:
+        case kOpcodeName_fdiv:
+        case kOpcodeName_fdivr:
+        case kOpcodeName_fidiv:
+        case kOpcodeName_fidivr:
+        case kOpcodeName_fcom:
+        case kOpcodeName_fcomp:
+        case kOpcodeName_fcompp:
+        case kOpcodeName_fucom:
+        case kOpcodeName_fucomp:
+        case kOpcodeName_fucompp:
+        case kOpcodeName_fcomi:
+        case kOpcodeName_fcomip:
+        case kOpcodeName_fucomi:
+        case kOpcodeName_fucomip:
+        case kOpcodeName_ficom:
+        case kOpcodeName_ficomp:
+        case kOpcodeName_fcmovb:
+        case kOpcodeName_fcmovbe:
+        case kOpcodeName_fcmove:
+        case kOpcodeName_fcmovnb:
+        case kOpcodeName_fcmovnbe:
+        case kOpcodeName_fcmovne:
+        case kOpcodeName_fcmovu:
+        case kOpcodeName_fcmovnu:
+        case kOpcodeName_fist:
+        case kOpcodeName_fistp:
+        case kOpcodeName_fisttp:
+        case kOpcodeName_fxch:
+            return 2;
+        default:
+            return is_handled_x87(op) ? 1 : 0;
+    }
+}
+
+int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
+                        int fpr_pool) {
     int count = 0;
     for (int64_t i = insn_idx; i < num_instrs; i++) {
-        if (!is_handled_x87(instr_array[i].opcode())) {
+        const uint16_t op = instr_array[i].opcode();
+        if (!is_handled_x87(op) || single_op_fpr_need(op) > fpr_pool) {
             break;
         }
         count++;
