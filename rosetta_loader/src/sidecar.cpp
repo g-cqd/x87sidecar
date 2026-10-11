@@ -42,6 +42,7 @@
 #include "rosetta_core/TransactionalList.h"
 #include "rosetta_core/TranslationResult.h"
 #include "rosetta_core/Translator.h"
+#include "rosetta_core/TranslatorHelpers.hpp"
 #include "rosetta_core/X87Cache.h"
 
 namespace sidecar {
@@ -2480,6 +2481,10 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
     // invalidates the persisted register cache before the None reply.
     std::optional<int64_t> result;
     bool allocation_failed = false;
+    // Same test on the same incoming pool as translate_instruction's decline,
+    // so a None reply for a short pool is not reported as UNHANDLED.
+    const bool fpr_pool_short =
+        !stock_hash_hit && Translator::fpr_pool_too_small(tr, localIR[req.insn_idx].opcode());
     if (!stock_hash_hit) {
         try {
             result = Translator::translate_instruction(
@@ -2487,6 +2492,24 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
                 static_cast<int64_t>(req.num_instrs), static_cast<int64_t>(req.insn_idx));
         } catch (const std::bad_alloc&) {
             std::fprintf(stderr, "[rosettax87] translation allocation failed\n");
+            allocation_failed = true;
+        } catch (const RegisterPoolExhausted& e) {
+            // Same exit as an allocation failure: nothing of this request is
+            // published, the guard invalidates the cache and stock translates
+            // the instruction.  The request-level decline is the fallback for
+            // a scratch need the dispatcher's pool check does not know.
+            static int exhausted = 0;
+            if (++exhausted <= 10 || exhausted % 1000 == 0) {
+                const uint16_t op = localIR[req.insn_idx].opcode();
+                std::fprintf(stdout,
+                             "[rosettax87] %s translating %s at idx=%lld/%lld (gpr=%08x "
+                             "fpr=%08x); stock translates it (#%d)\n",
+                             e.what(), op < kOpcodeNames.size() ? kOpcodeNames[op] : "?",
+                             static_cast<long long>(req.insn_idx),
+                             static_cast<long long>(req.num_instrs), tr.free_gpr_mask,
+                             tr.free_fpr_mask, exhausted);
+                std::fflush(stdout);
+            }
             allocation_failed = true;
         }
         if (result.has_value()) {
@@ -2671,9 +2694,10 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
         };
         const uint16_t op = localIR[req.insn_idx].opcode();
         // stock_hash_hit: the None reply is a deliberate whole-block
-        // exclusion, not a missing handler.
-        const bool deliberate =
-            stock_hash_hit || std::ranges::find(kKnownFallThrough, op) != kKnownFallThrough.end();
+        // exclusion, not a missing handler.  fpr_pool_short: stock's cached
+        // XMM scalars left too few scratch FPRs; the translator logged it.
+        const bool deliberate = stock_hash_hit || fpr_pool_short ||
+                                std::ranges::find(kKnownFallThrough, op) != kKnownFallThrough.end();
         if (!deliberate && out.stock_fallback_safe) {
             const char* name = (op < kOpcodeNames.size()) ? kOpcodeNames[op] : "?";
             fprintf(stdout,

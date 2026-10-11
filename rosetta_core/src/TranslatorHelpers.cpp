@@ -20,7 +20,9 @@ int alloc_gpr(TranslationResult& translation, int pool_index) {
 
 int alloc_free_gpr(TranslationResult& translation) {
     uint32_t mask = translation.free_gpr_mask;
-    assert(mask != 0 && "no temporary GPR available to allocate");
+    if (mask == 0) {
+        throw RegisterPoolExhausted("no temporary GPR available to allocate");
+    }
     int reg = __builtin_ctz(mask);  // lowest set bit = binary reverse of __clz(__rbit32)
     translation.free_gpr_mask = mask & ~(1U << reg);
     return reg;
@@ -42,7 +44,9 @@ void free_gpr(TranslationResult& translation, int reg) {
 
 auto alloc_free_fpr(TranslationResult& translation) -> int {
     uint32_t mask = translation.free_fpr_mask;
-    assert(mask != 0 && "no temporary FPR available to allocate");
+    if (mask == 0) {
+        throw RegisterPoolExhausted("no temporary FPR available to allocate");
+    }
     int reg = __builtin_ctz(mask);  // lowest set bit = binary reverse of __clz(__rbit32)
     translation.free_fpr_mask = mask & ~(1U << reg);
     return reg;

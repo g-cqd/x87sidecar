@@ -143,6 +143,7 @@ ALL_TESTS=(
     test_f2xm1
     test_fpatan
     test_fsincos
+    test_fpr_pool_pressure
     test_fptan
     test_fyl2x
     test_fyl2x_domain

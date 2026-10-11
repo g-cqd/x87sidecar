@@ -163,6 +163,60 @@ void successful_request() {
           "successful write-back retains the translated cache");
 }
 
+// Stock caches recent scalar SSE results in the V16-V31 temporaries, so the
+// scratch FPR pool can be anything from 8 to 0.  An instruction needing more
+// than is free used to abort the sidecar on alloc_free_fpr's assert (Crysis 3:
+// FSINCOS, peak 8, with 5 free); it must go to stock instead.
+void fpr_pool_short_declines(uint16_t opcode, uint32_t fprs, const char* name) {
+    Fixture fixture;
+    fixture.ir.set_opcode(opcode);
+    fixture.tr->free_fpr_mask = fprs;
+    fixture.tr->_unoccupied_temporary_fprs_for_xmm_scalars = fprs;
+    const auto result = fixture.translate();
+    check(!result.reply_some && result.stock_fallback_safe && fixture.tr->insn_buf.end == 0 &&
+              fixture.invalidated(),
+          name);
+}
+
+// The run stops before the instruction that cannot fit: the FLD1 ahead of
+// it stays ours and the reply ends at the FSINCOS for stock to take.
+void fpr_pool_short_ends_run() {
+    Fixture fixture;
+    std::array<IRInstr, 2> instructions{};
+    instructions[0].set_opcode(kOpcodeName_fld1);
+    instructions[1].set_opcode(kOpcodeName_fsincos);
+    fixture.request.instr_array = reinterpret_cast<uint64_t>(instructions.data());
+    fixture.request.num_instrs = instructions.size();
+    fixture.tr->free_fpr_mask = 0xF8000000U;
+    fixture.tr->_unoccupied_temporary_fprs_for_xmm_scalars = 0xF8000000U;
+    const auto result = fixture.translate();
+    check(result.reply_some && result.value == 1 && fixture.tr->insn_buf.end > 0,
+          "a run ends before the instruction the FPR pool cannot hold");
+}
+
+// Backstop for a scratch need the dispatcher does not know: an empty pool
+// throws, and the request declines without publishing instead of aborting.
+// Two scratch GPRs cannot hold the native-state boundary's seven.
+void register_pool_exhausted_declines() {
+    Fixture fixture;
+    fixture.tr->free_gpr_mask = 0x00C00000U;
+    remote_writes = 0;
+    const auto result = fixture.translate();
+    check(!result.reply_some && result.stock_fallback_safe && fixture.tr->insn_buf.end == 0 &&
+              fixture.invalidated() && remote_writes == 0,
+          "an exhausted scratch pool mid-translation falls back to stock without publishing");
+
+    TranslationResult tr{};
+    tr.free_fpr_mask = 0;
+    bool threw = false;
+    try {
+        alloc_free_fpr(tr);
+    } catch (const RegisterPoolExhausted&) {
+        threw = true;
+    }
+    check(threw, "alloc_free_fpr on an empty pool throws RegisterPoolExhausted");
+}
+
 void huge_spare_capacity() {
     Fixture fixture;
     fixture.tr->insn_buf.end_cap = UINT64_C(1) << 61;
@@ -488,5 +542,13 @@ int main() {
     for (unsigned kind = 0; kind < 5; ++kind) {
         isolated_malformed_buffer(kind);
     }
+    fpr_pool_short_declines(kOpcodeName_fsincos, 0xF8000000U,
+                            "FSINCOS with 5 free scratch FPRs falls back to stock");
+    fpr_pool_short_declines(kOpcodeName_fsin, 0xC0000000U,
+                            "FSIN with 2 free scratch FPRs falls back to stock");
+    fpr_pool_short_declines(kOpcodeName_fld1, 0,
+                            "FLD1 with no free scratch FPR falls back to stock");
+    fpr_pool_short_ends_run();
+    register_pool_exhausted_declines();
     return failures != 0;
 }

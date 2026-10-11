@@ -1,6 +1,7 @@
 #include "rosetta_core/Translator.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -35,6 +36,44 @@
 static bool is_x87_opcode(uint16_t op) {
     return (op >= kOpcodeName_fcmovb && op <= kOpcodeName_fucomip) ||
            (op >= kOpcodeName_f2xm1 && op <= kOpcodeName_fyl2xp1);
+}
+
+// ── Scratch FPR pool ────────────────────────────────────────────────────────
+// Every translator draws its FPR temporaries from free_fpr_mask, which stock
+// seeds from _unoccupied_temporary_fprs_for_xmm_scalars: the V16-V31 slots not
+// holding a cached scalar SSE result.  Each recent cvtsd2ss / sqrtsd / ... to
+// a fresh destination keeps one, so ordinary SSE code ahead of an x87
+// instruction in the same block leaves anywhere from 8 to 0 of them.  The IR
+// path measures its peak against the pool and declines; the single-instruction
+// translators used to assume the full 8 and hit alloc_free_fpr's assert
+// (Crysis 3: FSINCOS, peak 8, after SSE left 5).  An instruction that cannot
+// fit is stock's: the run ends before it and the reply that would start with
+// it declines before emitting anything.
+static constexpr int kNativeBoundaryFprNeed = 1;  // emit_native_state_boundary
+static constexpr int kPeepholeFprNeed = 3;        // largest fusion peak measured
+
+static int fpr_pool_size(const TranslationResult& tr) {
+    return std::popcount(tr.free_fpr_mask);
+}
+
+auto Translator::fpr_pool_too_small(const TranslationResult& tr, uint16_t opcode) -> bool {
+    const int need = std::max(kNativeBoundaryFprNeed, X87Cache::single_op_fpr_need(opcode));
+    return need > fpr_pool_size(tr);
+}
+
+static void log_fpr_pool_decline(const TranslationResult& tr, uint16_t opcode) {
+    static int count = 0;
+    ++count;
+    if (count <= 10 || count % 1000 == 0) {
+        const char* name = (opcode < kOpcodeNames.size()) ? kOpcodeNames[opcode] : "?";
+        std::fprintf(stdout,
+                     "[rosettax87] x87 %s needs %d scratch FPRs, stock left %d free "
+                     "(mask=%08x); stock translates it (#%d)\n",
+                     name,
+                     std::max(kNativeBoundaryFprNeed, X87Cache::single_op_fpr_need(opcode)),
+                     fpr_pool_size(tr), tr.free_fpr_mask, count);
+        std::fflush(stdout);
+    }
 }
 
 // Real body: one x87 instruction (or one fusion / one IR run).  The public
@@ -78,6 +117,13 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         gap.kind == TranslatorX87::GapFuseKind::kNone && is_x87_opcode(op) &&
         op != kOpcodeName_fclex && op != kOpcodeName_finit && op != kOpcodeName_fldenv &&
         op != kOpcodeName_fstenv && op != kOpcodeName_fxsave && op != kOpcodeName_fxrstor;
+    // Nothing is emitted yet and the previous reply ended on a native
+    // boundary, so stock can take this instruction from the X87State as is.
+    if (native_boundary && fpr_pool_too_small(*translation_result, op)) {
+        log_fpr_pool_decline(*translation_result, op);
+        cache.last_next_idx = -1;
+        return std::nullopt;
+    }
     const bool traced =
         native_boundary && x87trace::matches(instr_array, static_cast<size_t>(num_instrs));
     const uint64_t trace_site = uint64_t(instr_array[insn_idx].pc) << 32;
@@ -261,7 +307,13 @@ static auto translate_instruction_impl(TranslationResult* translation_result, IR
         if (!cache.active() && gap.kind == TranslatorX87::GapFuseKind::kNone) {
             const bool cache_disabled = g_rosetta_config && g_rosetta_config->disable_x87_cache;
             if (!cache_disabled) {
-                const int run = X87Cache::lookahead(instr_array, num_instrs, insn_idx);
+                // Every instruction of the run starts from the pool stock
+                // left (the dispatcher resets free_fpr_mask to it after each).
+                const int fpr_pool = std::min(
+                    fpr_pool_size(*translation_result),
+                    std::popcount(
+                        translation_result->_unoccupied_temporary_fprs_for_xmm_scalars));
+                const int run = X87Cache::lookahead(instr_array, num_instrs, insn_idx, fpr_pool);
                 cache.set_run(run);
                 // Run bridging: at a fresh run start, check whether short v1
                 // gaps join this run to following x87 segments.  Stash the
@@ -863,8 +915,11 @@ static auto translate_instruction_impl(TranslationResult* translation_result, IR
 
     // ── Peephole: try 2-instruction fusion patterns ─────────────────────────
     const uint64_t fusions_mask = g_rosetta_config ? g_rosetta_config->disabled_fusions_mask : 0;
-    const auto fused = TranslatorX87::try_peephole(translation_result, instr_array, num_instrs,
-                                                   insn_idx, fusions_mask);
+    const auto fused =
+        fpr_pool_size(*translation_result) >= kPeepholeFprNeed
+            ? TranslatorX87::try_peephole(translation_result, instr_array, num_instrs, insn_idx,
+                                          fusions_mask)
+            : std::nullopt;
 
     // ── Single-op fast path: fused emitters for isolated fld/fst/fstp ──────
     // Only when the cache is inactive (run==1, or cache disabled): no pinned
@@ -875,6 +930,18 @@ static auto translate_instruction_impl(TranslationResult* translation_result, IR
     if (!fused && !cache.active() &&
         !(g_rosetta_config && g_rosetta_config->disable_x87_single_fast)) {
         single_fast = TranslatorX87::try_translate_single_fast(translation_result, cur_instr);
+    }
+
+    // The lookahead already ends a run before an instruction that cannot fit
+    // and the reply entry declines one that starts a reply, so this only
+    // catches a pool that shrank mid-run; translate_instruction flushes.
+    if (!fused && !single_fast &&
+        X87Cache::single_op_fpr_need(opcode) > fpr_pool_size(*translation_result)) {
+        log_fpr_pool_decline(*translation_result, opcode);
+        cache.tally_ft = static_cast<uint16_t>(cache.tally_ft + 1);
+        mirror_tally();
+        translation_result->free_gpr_mask = cache.stock_free_gpr_mask;
+        return std::nullopt;
     }
 
     if (!fused && !single_fast) {
