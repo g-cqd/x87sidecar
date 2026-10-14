@@ -1,7 +1,6 @@
 #pragma once
 #include <cassert>
 #include <cstdint>
-#include <stdexcept>
 
 #include "rosetta_core/IROperand.h"
 #include "rosetta_core/Register.h"
@@ -22,26 +21,15 @@
 // simply released by restoring free_fpr_mask directly after use.
 // =============================================================================
 
-// Thrown by alloc_free_gpr / alloc_free_fpr when the scratch pool is empty.
-// Both pools are whatever stock leaves free at the request: the FPR pool is
-// the V16-V31 slots not holding a cached XMM scalar, and stock caches one per
-// recent scalar SSE result (cvtsd2ss, sqrtsd, ...), so it can be anywhere
-// from 8 down to 0.  Translator::fpr_pool_too_small keeps the dispatcher from
-// starting an instruction whose known need exceeds the pool; this is the
-// backstop for a need it does not know.  The sidecar translates on a private
-// copy of the TranslationResult, so it catches this, publishes nothing and
-// hands the instruction to stock.  It used to be an assert, and a game died
-// of it (Crysis 3, FSINCOS after scalar SSE code).
-struct RegisterPoolExhausted : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
 // =============================================================================
 // GPR allocation
 //
 // Allocates the next available scratch GPR from the pool at pool_index.
 // Marks the register as occupied in translation.free_gpr_mask.
-// Asserts if the pool slot is already occupied — callers must not double-allocate.
+// If the pool slot is already occupied (callers must not double-allocate),
+// records the failure in translation.alloc_failure, which declines the
+// request, or asserts under X87_STRICT_ALLOC.  Every allocator below does
+// the same when its pool is empty.
 //
 // pool_index: position in kGprScratchPool (0-based). Use sequentially:
 //   0 for first scratch GPR, 1 for second, etc.
@@ -50,6 +38,10 @@ struct RegisterPoolExhausted : std::runtime_error {
 // =============================================================================
 
 auto alloc_gpr(TranslationResult& translation, int pool_index) -> int;
+
+// X87_FAIL_ALLOC_EVERY: make every Nth allocation in the process fail as if
+// its pool were empty (0 = off).  Called by rosetta_set_config.
+void configure_alloc_fault_injection(uint32_t every);
 
 // ---------------------------------------------------------------------------
 // alloc_free_gpr — allocate lowest free scratch GPR directly from mask
