@@ -14,11 +14,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify tag is on master
+      - name: Verify tag is on main
         run: |
-          git fetch origin master --depth=1 || true
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not point at a commit on master"
+          git fetch origin main --depth=1 || true
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not point at a commit on main"
             exit 1
           fi
 
