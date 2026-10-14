@@ -208,13 +208,10 @@ void register_pool_exhausted_declines() {
 
     TranslationResult tr{};
     tr.free_fpr_mask = 0;
-    bool threw = false;
-    try {
-        alloc_free_fpr(tr);
-    } catch (const RegisterPoolExhausted&) {
-        threw = true;
-    }
-    check(threw, "alloc_free_fpr on an empty pool throws RegisterPoolExhausted");
+    tr.alloc_failure = nullptr;
+    const int placeholder_reg = alloc_free_fpr(tr);
+    check(tr.alloc_failure != nullptr && placeholder_reg >= 0,
+          "alloc_free_fpr on an empty pool sets alloc_failure instead of asserting");
 }
 
 void huge_spare_capacity() {

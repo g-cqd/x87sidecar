@@ -62,6 +62,12 @@
 //    all.
 //  * Block-level: if run bridging would join this FLD with later x87
 //    instructions into one IR region, the bridge keeps priority.
+//  * Neither X87_IGNORE_FTZ_DAZ nor X87_PRECISE_FAULTS is on.  Both act at
+//    the native-state boundary this fusion skips: the FPCR.FZ clear around
+//    the reply (without it the FCVTs below flush a denormal the unfused
+//    replies keep) and the fault probe of the reply's first memory operand
+//    (without it a fault in the copy aborts instead of reaching the guest
+//    handler with a precise context).
 //
 // The FSTP's reply is only a no-op because the FLD's reply recorded the
 // pairing in the cache (gap_tail_*); a FLD that stock translated itself
@@ -363,6 +369,12 @@ static auto match_gap_copy_impl(IRInstr* instrs, int64_t num, int64_t idx, int d
     }
     const RosettaConfig* cfg = g_rosetta_config;
     if (cfg != nullptr && fusion_is_disabled(*cfg, FusionId::fld_gap_fstp)) {
+        return -1;
+    }
+    // The boundary this fusion skips carries X87_IGNORE_FTZ_DAZ's FPCR
+    // handling and X87_PRECISE_FAULTS's probe; leave the pair to the unfused
+    // replies when either is on (see Legality above).
+    if (cfg != nullptr && (cfg->ignore_ftz_daz != 0 || precise_faults_enabled())) {
         return -1;
     }
     const IRInstr& fld = instrs[idx];

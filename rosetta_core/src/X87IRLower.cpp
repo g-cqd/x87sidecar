@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 #include "rosetta_core/AssemblerBuffer.h"
@@ -14,6 +15,7 @@
 #include "rosetta_core/TranslationResult.h"
 #include "rosetta_core/TranslatorHelpers.hpp"
 #include "rosetta_core/TranslatorX87.h"
+#include "rosetta_core/TranslatorX87F80.hpp"
 #include "rosetta_core/TranslatorX87Helpers.hpp"
 #include "rosetta_core/TranslatorX87Transcendental.hpp"
 #include "rosetta_core/X87Cache.h"
@@ -31,7 +33,8 @@ inline auto x87_begin(TranslationResult& a1, AssemblerBuffer& buf) -> std::pair<
         // early-stop) and the suffix re-enters lowering.
         if (!a1.x87_cache.st_base_valid) {
             const int Xst_base = alloc_gpr(a1, 6);
-            emit_add_imm(buf, 1, 0, 0, 0, kX87RegFileOff, a1.x87_cache.base_gpr, Xst_base);
+            emit_add_imm(buf, 1, 0, 0, 0, x87_st_base_off(a1.x87_cache), a1.x87_cache.base_gpr,
+                         Xst_base);
             a1.x87_cache.st_base_gpr = static_cast<int8_t>(Xst_base);
             a1.x87_cache.st_base_valid = 1;
         }
@@ -45,7 +48,7 @@ inline auto x87_begin(TranslationResult& a1, AssemblerBuffer& buf) -> std::pair<
         a1.x87_cache.base_gpr = static_cast<int8_t>(Xbase);
         a1.x87_cache.top_gpr = static_cast<int8_t>(Wd_top);
         const int Xst_base = alloc_gpr(a1, 6);
-        emit_add_imm(buf, 1, 0, 0, 0, kX87RegFileOff, Xbase, Xst_base);
+        emit_add_imm(buf, 1, 0, 0, 0, x87_st_base_off(a1.x87_cache), Xbase, Xst_base);
         a1.x87_cache.st_base_gpr = static_cast<int8_t>(Xst_base);
         a1.x87_cache.gprs_valid = 1;
         a1.x87_cache.st_base_valid = 1;
@@ -71,10 +74,17 @@ inline void perm_flush_before_stack_change(AssemblerBuffer& buf, TranslationResu
                                            int Wd_top, int Wd_tmp) {
     if (a1.x87_cache.perm_dirty) {
         const int Xst_base = x87_get_st_base(a1);
+        const bool images = x87_perm_moves_f80(a1.x87_cache.perm);
         const int Dd_save = alloc_free_fpr(a1);
         const int Dd_chain = alloc_free_fpr(a1);
+        const int Hd_save = images ? alloc_free_fpr(a1) : -1;
+        const int Hd_chain = images ? alloc_free_fpr(a1) : -1;
         emit_x87_perm_flush(buf, Xbase, Wd_top, Wd_tmp, a1.x87_cache.perm, Xst_base, Dd_save,
-                            Dd_chain);
+                            Dd_chain, Hd_save, Hd_chain);
+        if (images) {
+            free_fpr(a1, Hd_chain);
+            free_fpr(a1, Hd_save);
+        }
         free_fpr(a1, Dd_chain);
         free_fpr(a1, Dd_save);
         a1.x87_cache.reset_perm();
@@ -85,6 +95,29 @@ inline void perm_flush_before_stack_change(AssemblerBuffer& buf, TranslationResu
 namespace X87IR {
 
 static constexpr int16_t kX87TagWordImm12 = kX87TagWordOff / 2;  // = 2
+
+// X87_NATIVE_SLOTS: an integer store (fist, fistp, fisttp) of a register the
+// run has not changed and that still holds its 80-bit value.  lower() then
+// converts the slot's ten bytes exactly (emit_f80_slot_to_int) and
+// peak_live_gprs charges the four registers that takes.
+static bool stores_native_slot(const Context& ctx, const Node& n) {
+    if (n.op != Op::StoreI16 && n.op != Op::StoreI32 && n.op != Op::StoreI64) {
+        return false;
+    }
+    const Node& src = ctx.nodes[n.inputs[0]];
+    return src.op == Op::ReadSt && ((ctx.native_depths >> src.initial_depth) & 1U) != 0;
+}
+
+// X87_NATIVE_SLOTS: an fst m32 of such a register.  lower() narrows from the
+// 80-bit value (rounding once) and peak_live_gprs charges the conversion's
+// three registers.
+static bool narrows_native_slot(const Context& ctx, const Node& n) {
+    if (n.op != Op::StoreF32) {
+        return false;
+    }
+    const Node& src = ctx.nodes[n.inputs[0]];
+    return src.op == Op::ReadSt && ((ctx.native_depths >> src.initial_depth) & 1U) != 0;
+}
 
 // ── FPR assignment ──────────────────────────────────────────────────────────
 
@@ -177,6 +210,7 @@ static SimpleMemRef get_simple_mem(const Node& n) {
     if ((op.mem.mem_flags & 2U) != 0) {  // index register present
         return {.ok = false, .base_reg = 0, .disp = 0};
     }
+    // Defensive: build() already ends a run at any segment-override operand.
     if (op.mem.seg_override != 0) {
         return {.ok = false, .base_reg = 0, .disp = 0};
     }
@@ -637,7 +671,25 @@ void lower(Context& ctx, TranslationResult* result) {
             case Op::ReadSt: {
                 int Dd = alloc_free_fpr(*result);
                 fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-                emit_load_st(buf, Xbase, Wd_top, n.initial_depth, Wd_tmp, Dd, Xst_base);
+                if ((ctx.native_depths >> n.initial_depth) & 1U) {
+                    // X87_NATIVE_SLOTS: convert the 80-bit value into Dd and
+                    // leave the slot as it is, so a slot the run only reads
+                    // keeps every bit.  Wd_tmp holds the address until both
+                    // halves are loaded, then serves the conversion.
+                    emit_native_st_addr(buf, Xbase, Wd_top, n.initial_depth, Wd_tmp, Xst_base);
+                    const int Xm = alloc_free_gpr(*result);
+                    const int Wx = alloc_free_gpr(*result);
+                    const int Xt2 = alloc_free_gpr(*result);
+                    emit_ldr_str_imm(buf, 3, 0, /*LDR*/ 1, 0, Wd_tmp, Xm);
+                    emit_ldr_str_imm(buf, 1, 0, /*LDRH*/ 1, 4, Wd_tmp, Wx);
+                    TranslatorX87::emit_f80_bits_to_f64(buf, Xm, Wx, Wd_tmp, Xt2);
+                    emit_fmov_x_to_d(buf, Dd, Xm);
+                    free_gpr(*result, Xt2);
+                    free_gpr(*result, Wx);
+                    free_gpr(*result, Xm);
+                } else {
+                    emit_load_st(buf, Xbase, Wd_top, n.initial_depth, Wd_tmp, Dd, Xst_base);
+                }
                 break;
             }
             case Op::LoadF64: {
@@ -990,9 +1042,11 @@ void lower(Context& ctx, TranslationResult* result) {
                     Dd = alloc_free_fpr(*result);
                 }
                 fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-                int cond = static_cast<int>(n.imm_bits & 0xF);
-                // FCSEL Dd, Dn_true, Dm_false, cond → Dd = cond ? Dn : Dm
-                emit_fcsel_f64(buf, Dd, Dm, Dn, cond);
+                // An AArch64 condition code, or kFcmovCondPF/NPF for
+                // FCMOVU/FCMOVNU, which read PF from NZCV bit 26.
+                int cond = static_cast<int>(n.imm_bits);
+                // Dd = cond ? Dm (true arm) : Dn (false arm)
+                emit_fcmov_select(buf, *result, Dd, Dm, Dn, cond);
                 break;
             }
 
@@ -1025,7 +1079,27 @@ void lower(Context& ctx, TranslationResult* result) {
                 // for STP S / STR S, and as the source lane for the broadcast
                 // DUP that feeds STR Q.
                 const int Ds_narrow = alloc_free_fpr(*result);
-                emit_fcvt_d_to_s(buf, Ds_narrow, fprs.get(src_node));
+                if (narrows_native_slot(ctx, n)) {
+                    // X87_NATIVE_SLOTS: narrow from the slot's 80-bit value,
+                    // converted rounding to odd, so the value is rounded once
+                    // (the ReadSt's binary64 copy would round it twice).
+                    const int depth = ctx.nodes[src_node].initial_depth;
+                    emit_native_st_addr(buf, Xbase, Wd_top, depth, Wd_tmp, Xst_base);
+                    const int Xm = alloc_free_gpr(*result);
+                    const int Wx = alloc_free_gpr(*result);
+                    const int Xt2 = alloc_free_gpr(*result);
+                    emit_ldr_str_imm(buf, 3, 0, /*LDR*/ 1, 0, Wd_tmp, Xm);
+                    emit_ldr_str_imm(buf, 1, 0, /*LDRH*/ 1, 4, Wd_tmp, Wx);
+                    TranslatorX87::emit_f80_bits_to_f64(buf, Xm, Wx, Wd_tmp, Xt2,
+                                                        /*round_to_odd=*/true);
+                    emit_fmov_x_to_d(buf, Ds_narrow, Xm);
+                    free_gpr(*result, Xt2);
+                    free_gpr(*result, Wx);
+                    free_gpr(*result, Xm);
+                    emit_fcvt_d_to_s(buf, Ds_narrow, Ds_narrow);
+                } else {
+                    emit_fcvt_d_to_s(buf, Ds_narrow, fprs.get(src_node));
+                }
 
                 // Allocate the broadcast Q register lazily — only if at least
                 // one STR Q group fires.  Most benches that take the STP S or
@@ -1084,6 +1158,34 @@ void lower(Context& ctx, TranslationResult* result) {
             case Op::StoreI16:
             case Op::StoreI32:
             case Op::StoreI64: {
+                if (stores_native_slot(ctx, n)) {
+                    // X87_NATIVE_SLOTS: the value is a register still in its
+                    // 80-bit slot (the body writes no slot before the
+                    // epilogue), so convert the ten bytes exactly, as the
+                    // direct emitters do, instead of its binary64 copy.
+                    const int depth = ctx.nodes[n.inputs[0]].initial_depth;
+                    const int Xslot = alloc_free_gpr(*result);
+                    const int Xint = alloc_free_gpr(*result);
+                    const int Xm = alloc_free_gpr(*result);
+                    const int Wx = alloc_free_gpr(*result);
+                    emit_native_st_addr(buf, Xbase, Wd_top, depth, Xslot, Xst_base);
+                    using TranslatorX87::NativeIntRound;
+                    const NativeIntRound round = (n.flags & kTruncate) ? NativeIntRound::kChop
+                                                 : fast_round        ? NativeIntRound::kNearest
+                                                                     : NativeIntRound::kControlWord;
+                    const int bits = n.op == Op::StoreI16 ? 16 : n.op == Op::StoreI32 ? 32 : 64;
+                    TranslatorX87::emit_f80_slot_to_int(buf, Xbase, Xslot, Xint, Xm, Wx, Wd_tmp,
+                                                        round, bits);
+                    free_gpr(*result, Wx);
+                    free_gpr(*result, Xm);
+                    free_gpr(*result, Xslot);
+                    const int addr =
+                        compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
+                    emit_str_imm(buf, bits == 16 ? 1 : bits == 32 ? 2 : 3, Xint, addr, 0);
+                    free_gpr(*result, addr);
+                    free_gpr(*result, Xint);
+                    break;
+                }
                 int Dd_val = fprs.get(n.inputs[0]);
                 int Wd_int = alloc_free_gpr(*result);
                 // X-width conversion for every size — emit_fist_indefinite_guard
@@ -1119,6 +1221,7 @@ void lower(Context& ctx, TranslationResult* result) {
                 }
 
                 // NaN / out-of-range → integer indefinite (x86 semantics).
+                // The guard's scratch FPR is counted in peak_live_fprs.
                 emit_fist_indefinite_guard(*result, buf, Wd_int, Dd_val, int_size);
 
                 int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
@@ -1174,34 +1277,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 int Dd_src = fprs.get(n.inputs[1]);
 
                 emit_fcmp_f64(buf, Dd_st0, Dd_src);
-
-                // Extract condition bits before any MSR clobbers NZCV.
-                int Wd_z = alloc_free_gpr(*result);
-                int Wd_v = alloc_free_gpr(*result);
-                int Wd_c = alloc_free_gpr(*result);
-
-                emit_cset(buf, /*is_64bit=*/0, /*cond=*/0 /*EQ*/, Wd_z);  // 1 if equal
-                emit_cset(buf, /*is_64bit=*/0, /*cond=*/6 /*VS*/, Wd_v);  // 1 if unordered
-                emit_cset(buf, /*is_64bit=*/0, /*cond=*/2 /*CS*/, Wd_c);  // 1 if carry set
-
-                // Z_new = Z | V  (equal or unordered → ZF)
-                emit_logical_shifted_reg(buf, 0, /*ORR*/ 1, 0, /*LSL*/ 0, Wd_v, 0, Wd_z, Wd_z);
-                // C_new = C & !V  (carry clear for unordered → CF)
-                emit_logical_shifted_reg(buf, 0, /*AND*/ 0, /*N=invert rhs*/ 1, /*LSL*/ 0, Wd_v, 0,
-                                         Wd_c, Wd_c);
-
-                // Pack NZCV: bit30=ZF, bit29=CF, bit28=V(PF for FCMOV), bit26=PF
-                emit_bitfield(buf, /*is_64bit=*/0, /*opc=*/2 /*UBFM*/, /*N=*/0,
-                              /*immr=*/2, /*imms=*/1, Wd_z, Wd_z);
-                emit_logical_shifted_reg(buf, 0, /*ORR*/ 1, 0, /*LSL*/ 0, Wd_c, 29, Wd_z, Wd_z);
-                emit_logical_shifted_reg(buf, 0, /*ORR*/ 1, 0, /*LSL*/ 0, Wd_v, 28, Wd_z, Wd_z);
-                emit_logical_shifted_reg(buf, 0, /*ORR*/ 1, 0, /*LSL*/ 0, Wd_v, 26, Wd_z, Wd_z);
-
-                emit_msr_nzcv(buf, Wd_z);
-
-                free_gpr(*result, Wd_c);
-                free_gpr(*result, Wd_v);
-                free_gpr(*result, Wd_z);
+                // ZF, PF (NZCV bit 26) and CF from the compare; SF, OF, AF clear.
+                emit_fcomi_nzcv(buf, *result);
                 // Pop (for FCOMIP/FUCOMIP) is handled by the IR epilogue via top_delta.
                 break;
             }
@@ -1411,9 +1488,10 @@ void lower(Context& ctx, TranslationResult* result) {
                         free_gpr(*result, Wd_adj);
                     }
 
-                    // BFI W_ax, Wd_sw, #0, #16 — write status_word into x86 AX
-                    int W_ax = n.inputs[1];  // destination register index (usually 0 = W0)
-                    emit_bitfield(buf, 0, /*BFM*/ 1, 0, /*immr=*/0, /*imms=*/15, Wd_sw, W_ax);
+                    // BFI X_ax, Xd_sw, #0, #16: write status_word into x86 AX.
+                    // 64-bit form, so RAX bits 63:16 are left as they were.
+                    int W_ax = n.inputs[1];  // destination register index (usually 0 = X0)
+                    emit_bitfield(buf, 1, /*BFM*/ 1, 1, /*immr=*/0, /*imms=*/15, Wd_sw, W_ax);
                     free_gpr(*result, Wd_sw);
                 }
                 break;
@@ -1435,6 +1513,11 @@ void lower(Context& ctx, TranslationResult* result) {
             emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, ctx.top_delta, Wd_top, Wd_top);
         }
         emit_and_imm(buf, 0, Wd_top, 0, 0, 2, Wd_top);
+        if (ctx.top_delta > 0) {
+            x87_slot_note_pop(ctx.top_delta);
+        } else {
+            x87_slot_note_push(-ctx.top_delta);
+        }
     }
 
     // 2. Store modified stack values.
@@ -1532,12 +1615,27 @@ void lower(Context& ctx, TranslationResult* result) {
 // Permanent GPRs (held for the entire lower() duration):
 //   - Xbase (pool 0), Wd_top (pool 1), Wd_tmp (pool 2), Xst_base (pool 6) = 4
 //   - Wd_rc_cached (pool 3) when RC caching is active = +1
+//   - minus cached_gprs: when the run cache is active, x87_begin reuses
+//     the Xbase, Wd_top and (if still valid) Xst_base it holds.  The
+//     dispatcher keeps those out of free_gpr_mask (pinned_mask()), so the
+//     budget compile_run passes in already excludes them.  This is the
+//     usual shape for the suffix after a split prefix.
+//
+// Prologue (before any node, Wd_rc_cached not yet allocated): flushing an
+// incoming tag_push_pending takes 1 more GPR, incoming deferred pops 2
+// (Wd_tmp2 + Wd_tagw).  preamble_gprs carries that from the cache state.
 //
 // Per-node transient GPR demand (mirrors the lowering code exactly):
-//   - ReadSt, Const*, FAdd/FSub/FMul/FDiv, FMA*, FNeg/FAbs/FSqrt, FCSel: 0
-//   - LoadF64, LoadF32, StoreF64, StoreF32: 1 (addr from compute_operand_address)
+//   - ReadSt, Const*, FAdd/FSub/FMul/FDiv, FMA*, FNeg/FAbs/FSqrt: 0
+//   - ReadSt of an 80-bit slot (ctx.native_depths): 3 (Xm, Wx, Xt2 of the
+//     conversion; Wd_tmp is permanent)
+//   - FCSel: 0, or 1 for FCMOVU/FCMOVNU (the MRS that reads PF)
+//   - FMAdd FMA-reduce head: 1 (load address inside lower_fma_reduce)
+//   - LoadF64, LoadF32, StoreF64, StoreF32: 1 (addr from compute_operand_address);
+//     3 for a StoreF32 narrowing an 80-bit slot (narrows_native_slot)
 //   - LoadI16/I32/I64: 2 (addr + Wd_val)
-//   - StoreI16/I32/I64: 2 (Wd_int + addr)
+//   - StoreI16/I32/I64: 2 (Wd_int + the indefinite guard's Xt, then Wd_int + addr);
+//     4 for an exact store of an 80-bit slot (stores_native_slot)
 //   - FRndInt without RC cache: 1 (Wd_rc via alloc_gpr(3))
 //   - FCmp/FTst: 4 peak inside emit_fcom_cc_pack (Wd_save + Wd_packed + Wd_cc + Wd_vs)
 //     If kFcomFused, Wd_packed stays alive until consumed by FStsw.
@@ -1555,7 +1653,8 @@ void lower(Context& ctx, TranslationResult* result) {
 // before node_total would double-count it (predicting peak=9 instead of 8
 // for the common single-fused-FCmp+FStsw pair, gating off real WoW blocks
 // that fit in the 8-slot pool).
-int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fast_round) {
+int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fast_round,
+                   int cached_gprs, int preamble_gprs) {
     if (first_over_node) {
         *first_over_node = -1;
     }
@@ -1593,7 +1692,7 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
         rc_cache = !has_fcmp && rc_count >= 2;
     }
 
-    int pinned = 4;  // Xbase, Wd_top, Wd_tmp, Xst_base
+    int pinned = 4 - cached_gprs;  // Xbase, Wd_top, Wd_tmp, Xst_base not held by the cache
     if (rc_cache) {
         pinned++;  // Wd_rc_cached
     }
@@ -1602,6 +1701,15 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
     // "held" tracks GPRs held alive across node boundaries (fused FCmp→FStsw).
     int held = 0;
     int peak = pinned;  // at minimum, permanent GPRs
+
+    // Prologue flush of incoming deferred tag state.  No prefix of the run
+    // avoids it, so an overflow here is attributed to the first node and
+    // the split loop gives up instead of retrying shorter prefixes.
+    const int prologue_total = (4 - cached_gprs) + preamble_gprs;
+    peak = std::max(prologue_total, peak);
+    if (first_over_node && prologue_total > budget && ctx.num_nodes > 0) {
+        *first_over_node = 0;
+    }
 
     for (int i = 0; i < ctx.num_nodes; i++) {
         const auto& n = ctx.nodes[i];
@@ -1612,8 +1720,14 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
         int transient = 0;  // per-node transient GPR demand
 
         switch (n.op) {
-            // No transient GPRs
+            // ReadSt of an 80-bit slot (X87_NATIVE_SLOTS): the conversion
+            // takes three registers besides Wd_tmp.
             case Op::ReadSt:
+                if ((ctx.native_depths >> n.initial_depth) & 1U) {
+                    transient = 3;
+                }
+                break;
+            // No transient GPRs
             case Op::ConstZero:
             case Op::ConstOne:
             case Op::ConstF64:
@@ -1621,13 +1735,28 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
             case Op::FSub:
             case Op::FMul:
             case Op::FDiv:
-            case Op::FMAdd:
             case Op::FMSub:
             case Op::FNMSub:
             case Op::FNeg:
             case Op::FAbs:
             case Op::FSqrt:
+                break;
+
+            // FCSel: 0, except FCMOVU/FCMOVNU, which read NZCV into one
+            // GPR to test PF (emit_fcmov_select).
             case Op::FCSel:
+                if (n.imm_bits == kFcmovCondPF || n.imm_bits == kFcmovCondNPF) {
+                    transient = 1;
+                }
+                break;
+
+            // FMAdd: 0, except an FMA-reduce head, whose lower_fma_reduce
+            // body forms each load address with compute_operand_address
+            // (one at a time, freed after its load) = 1.
+            case Op::FMAdd:
+                if (n.flags & kFmaReduceHead) {
+                    transient = 1;
+                }
                 break;
 
             // Transcendentals — peak GPR demand inside emit_inline_<op>_core
@@ -1635,16 +1764,18 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
             // clobbering cores is included in each count):
             //   sin/cos: Xconst held + ~2 internal in trig_range_reduce/poly = 3
             //   fptan:   Xconst + Xqi held + brief Xnzcv at the TST = 3
-            //   fpatan:  Xconst + Xsign_xy held + Xnzcv over steps 3-5 = 3
+            //   fpatan:  Xconst + Xsign_xy + Xnzcv over steps 3-5, plus Xk
+            //            for the step-3 1.0 constant or Xbits for the
+            //            step-5 sign test = 4
             //   fyl2x:   Xconst + ~3 inside log2 (Xu, Xu_off, Xidx peak) = 4
             //   fscale:  Wd_k + Wd_e + Xnzcv + brief Xtemp at overflow CSEL = 4
             // Conservative bound across the family.
             case Op::FSin:
             case Op::FCos:
             case Op::FPtan:
-            case Op::FPatan:
                 transient = 3;
                 break;
+            case Op::FPatan:
             case Op::FYl2x:
             case Op::FScale:
                 transient = 4;
@@ -1655,7 +1786,9 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
             case Op::LoadF32:
             case Op::StoreF64:
             case Op::StoreF32:
-                transient = 1;
+                // Narrowing an 80-bit slot takes Xm, Wx and Xt2 before the
+                // address.
+                transient = narrows_native_slot(ctx, n) ? 3 : 1;
                 break;
 
             // 2 GPRs: Loads need addr + Wd_val; stores need Wd_int + addr.
@@ -1665,7 +1798,9 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
             case Op::StoreI16:
             case Op::StoreI32:
             case Op::StoreI64:
-                transient = 2;
+                // An exact store of an 80-bit slot holds Xslot, Xint, Xm and
+                // Wx (Wd_tmp is permanent), then Xint and the address.
+                transient = stores_native_slot(ctx, n) ? 4 : 2;
                 break;
 
             // FRndInt: 1 GPR if no RC cache (alloc_gpr(3) for Wd_rc), 0 with cache
@@ -1757,7 +1892,10 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
     // lower() releases Xst_base before allocating those two — the tag-batch
     // helpers don't use it — so the actual peak at the epilogue is
     // (pinned - 1) + held + 2.  Mirror that here so the gate predicts peak
-    // accurately and runs that previously hit peak=6 fit at peak=5.
+    // accurately and runs that previously hit peak=6 fit at peak=5.  When
+    // the cache held Xst_base it is not in `pinned`, but freeing it still
+    // adds one register to the pool the budget was counted from, so the
+    // same -1 applies.
     if (ctx.top_delta != 0) {
         int epilogue_total = (pinned - 1) + held + 2;
         peak = std::max(epilogue_total, peak);
@@ -1785,9 +1923,11 @@ int peak_live_gprs(const Context& ctx, int budget, int* first_over_node, bool fa
 //     *during* a node is: (currently live) + 1 for the new output, before dead
 //     inputs are freed.  try_reuse_input() can avoid the +1 by recycling a
 //     dying input's FPR, but we conservatively ignore reuse here.
-//   - StoreF32 allocates one extra transient FPR (Ds_tmp) that is freed before
-//     the node ends.  Model as a +1 spike.
-//   - StoreI*, FCmp, FTst, FStsw produce no FPR output and need no extra FPRs.
+//   - StoreF32 allocates Ds_narrow, plus Vq_broadcast for a STR Q group, and
+//     frees them before the node ends.  Model as a +1 or +2 spike.
+//   - StoreI* allocates one transient FPR (Dscr in the indefinite guard)
+//     while its input is held.  Model as a +1 spike.
+//   - FCmp, FTst, FStsw produce no FPR output and need no extra FPRs.
 //   - Dead (kDead) nodes are skipped.
 int peak_live_fprs(const Context& ctx, int budget, int* first_over_node) {
     if (first_over_node) {
@@ -1953,6 +2093,13 @@ int peak_live_fprs(const Context& ctx, int budget, int* first_over_node) {
             raise_peak(live + spike, i);
         }
 
+        // StoreI16/32/64: emit_fist_indefinite_guard allocates Dscr for its
+        // NaN check while the input is still held (free_dead_inputs runs
+        // after the node).  A +1 spike, the same as a lone StoreF32.
+        if (n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64) {
+            raise_peak(live + 1, i);
+        }
+
         // Transcendentals: the lowering copies each input into a freshly
         // allocated pool FPR that the *_core takes ownership of, calls
         // free_dead_inputs() mid-case, then runs the polynomial body which
@@ -2007,9 +2154,21 @@ int peak_live_fprs(const Context& ctx, int budget, int* first_over_node) {
                 break;
         }
         if (trans_spike > 0) {
+            // Count each dying node once.  fld st(0) or fst st(i) can give
+            // both operands of fpatan / fyl2x / fscale the same node, and
+            // free_dead_inputs releases its FPR only once; counting it per
+            // operand undercounts the spike by one.
             int dying_inputs = 0;
-            for (short in : n.inputs) {
-                if (in >= 0 && last_use[in] == i && holding[in]) {
+            for (size_t k = 0; k < std::size(n.inputs); k++) {
+                const short in = n.inputs[k];
+                if (in < 0 || last_use[in] != i || !holding[in]) {
+                    continue;
+                }
+                bool seen = false;
+                for (size_t m = 0; m < k; m++) {
+                    seen = seen || n.inputs[m] == in;
+                }
+                if (!seen) {
                     dying_inputs++;
                 }
             }
@@ -2063,16 +2222,8 @@ static int split_prefix_len(const Context& ctx, int first_over_node, int attempt
 // Lives here (not X87IROptimize.cpp) because candidate legality and payoff
 // are joined at the hip with the peak_live_fprs model above.
 
-// FStsw packs payloads into its input slots (inputs[1] = destination
-// register index, inputs[2] = top_delta snapshot — see build()); only
-// inputs[0] (the fused FCmp reference) is a node id.  Every walk below
-// that interprets inputs as node references must skip the payload slots,
-// or a payload value that happens to collide with a node index gets
-// remapped/retargeted and the lowering emits garbage (observed as a WoW
-// guest SIGSEGV when remat rewrote an FStsw's register-index payload).
-static inline int node_ref_input_count(const Node& n) {
-    return n.op == Op::FStsw ? 1 : 3;
-}
+// Every walk below that interprets inputs as node references skips FStsw's
+// payload slots via node_ref_input_count (X87IR.h).
 
 // Insert a copy of nodes[src] at index `pos` (shifting [pos..) up one) and
 // return false if the node budget is exhausted.  All node references —
@@ -2200,6 +2351,7 @@ static bool remat_relieve_fpr_pressure(Context& ctx, int budget) {
             const int use = last_use[h];
             // A load may not cross a memory write or FStsw (writes AX or
             // memory) between its original position and the sunk position.
+            // LoadCW is fnstcw, a 16-bit memory write.
             if (is_load) {
                 bool barrier = false;
                 for (int j = h + 1; j < use && !barrier; j++) {
@@ -2214,6 +2366,7 @@ static bool remat_relieve_fpr_pressure(Context& ctx, int budget) {
                         case Op::StoreI32:
                         case Op::StoreI64:
                         case Op::StoreCW:
+                        case Op::LoadCW:
                         case Op::FStsw:
                         // Bridge nodes: a bridge store may alias the load,
                         // and any bridge register write may redefine the
@@ -2302,6 +2455,29 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         gpr_available++;
         gpr_pool &= gpr_pool - 1;
     }
+    // With the run cache active (the suffix after a split prefix or a
+    // build early-stop), x87_begin reuses the cached Xbase, Wd_top and
+    // Xst_base, which the dispatcher has already taken out of
+    // free_gpr_mask.  Tell the GPR model so it does not charge them to
+    // gpr_available a second time.  Only registers actually missing from
+    // the free mask are counted, so the model can never drop below what
+    // lower() draws from it.
+    int cached_gprs = 0;
+    if (result->x87_cache.run_remaining > 0 && result->x87_cache.gprs_valid) {
+        uint32_t held = result->x87_cache.pinned_mask() & ~result->free_gpr_mask;
+        while (held) {
+            cached_gprs++;
+            held &= held - 1;
+        }
+    }
+    // Scratch lower()'s prologue takes to flush deferred tag state the
+    // gate cascade left behind (see the flushes at the top of lower()).
+    int preamble_gprs = 0;
+    if (result->x87_cache.deferred_pop_count > 0) {
+        preamble_gprs = 2;
+    } else if (result->x87_cache.tag_push_pending) {
+        preamble_gprs = 1;
+    }
     if (g_rosetta_config) {
         if (g_rosetta_config->fpr_pool_limit > 0 && available > g_rosetta_config->fpr_pool_limit) {
             available = g_rosetta_config->fpr_pool_limit;
@@ -2366,6 +2542,18 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         }
 
         optimize(ctx);
+        // X87_NATIVE_SLOTS: which initial depths hold an 80-bit value.
+        // lower()'s prologue flushes a leftover FXCH permutation by moving
+        // the slots as they are, so depth d then holds what was at depth
+        // perm[d] (the identity when no permutation is pending).
+        if (result->x87_cache.native_slots) {
+            const auto& c = result->x87_cache;
+            for (int d = 0; d < 8; d++) {
+                if (c.slot_fmt[(c.top_rel + c.perm[d]) & 7] == kSlotNative) {
+                    ctx.native_depths = static_cast<uint8_t>(ctx.native_depths | (1U << d));
+                }
+            }
+        }
 
         // Gate lowering on actual FPR pressure vs. available pool.  Before
         // splitting, try the cheaper relief: sink/clone long-lived consts
@@ -2403,15 +2591,33 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
             }
             if (out_peak_gprs) {
                 *out_peak_gprs =
-                    peak_live_gprs(ctx, 0x7FFFFFFF, nullptr, x87_fast_round_active(*result));
+                    peak_live_gprs(ctx, 0x7FFFFFFF, nullptr, x87_fast_round_active(*result),
+                                   cached_gprs, preamble_gprs);
             }
             return 0;
+        }
+
+        // lower()'s prologue flushes a leftover FXCH permutation through two
+        // FPRs, four when it moves 80-bit images (X87_NATIVE_SLOTS), before
+        // any node holds one.
+        if (result->x87_cache.perm_dirty) {
+            const int flush_fprs = x87_perm_moves_f80(result->x87_cache.perm) ? 4 : 2;
+            if (flush_fprs > available) {
+                if (out_reason) {
+                    *out_reason = IRFailReason::kFprPressure;
+                }
+                if (out_peak_gprs) {
+                    *out_peak_gprs = 0;
+                }
+                return 0;
+            }
         }
 
         // Gate lowering on GPR pressure vs. available pool.
         int gpr_over_node = -1;
         const int peak_gprs =
-            peak_live_gprs(ctx, gpr_available, &gpr_over_node, x87_fast_round_active(*result));
+            peak_live_gprs(ctx, gpr_available, &gpr_over_node, x87_fast_round_active(*result),
+                           cached_gprs, preamble_gprs);
         if (out_peak_gprs) {
             *out_peak_gprs = peak_gprs;
         }

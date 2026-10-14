@@ -70,6 +70,7 @@ std::atomic<uint64_t> g_statVmSyscalls{0};  // mach_vm_* traps on the translate 
 std::atomic<uint64_t> g_statTcoHits{0};     // TCO served from cache
 std::atomic<uint64_t> g_statIrHits{0};      // IR array served from cache (probe read only)
 std::atomic<uint64_t> g_statIrMisses{0};    // IR array read in full
+std::atomic<uint64_t> g_statAllocDeclines{0};  // requests declined after an allocation failure
 
 // X87_PROFILE state.  Opened once at sidecar startup; closed when the
 // receive thread exits (i.e. parent process death).  Block-id assignment
@@ -237,6 +238,7 @@ struct IRCacheEntry {
     uint64_t next_idx = 0;  // where the previous reply told stock to continue
     uint64_t hash = 0;      // profile::hash_ir_stream of ir, when hash_valid
     bool hash_valid = false;
+    bool has_bcd = false;  // ir contains FBLD or FBSTP; set on every fill
     std::vector<IRInstr> ir;
 };
 std::unordered_map<uint64_t, IRCacheEntry> g_irCache;
@@ -2316,6 +2318,9 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
             irc.instr_array = req.instr_array;
             irc.num_instrs = req.num_instrs;
             irc.hash_valid = false;
+            irc.has_bcd = std::ranges::any_of(irc.ir, [](const IRInstr& ins) {
+                return ins.opcode() == kOpcodeName_fbld || ins.opcode() == kOpcodeName_fbstp;
+            });
             g_statIrMisses.fetch_add(1, std::memory_order_relaxed);
         }
         // Conservative until the reply is known; the Some path below moves it.
@@ -2477,41 +2482,33 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
         }
     }
 
-    // A stock hit leaves the transaction uncommitted, so the guard
-    // invalidates the persisted register cache before the None reply.
-    std::optional<int64_t> result;
-    bool allocation_failed = false;
+    // A block containing FBLD or FBSTP goes to stock whole, unless
+    // X87_STOCK_BCD=0.  An 18-digit BCD integer needs up to 60 significand
+    // bits, which stock's 80-bit registers hold and the binary64 register
+    // file does not, and the value usually reaches FBSTP through other
+    // instructions of the same block (FILD m64 in Delphi's CurrToStr, the
+    // power-of-ten scaling in FloatToDecimal) that have to stay in 80 bits
+    // as well.  Such blocks are rare, and the inline FBSTP measured only
+    // about 1.7x faster than stock's.  This is the default rather than a
+    // diagnostic, so unlike the lists above it logs nothing.  The scan is
+    // done once per IR-cache fill (irc.has_bcd).
+    const bool stock_bcd_hit = !stock_hash_hit && g_rosetta_config != nullptr &&
+                               g_rosetta_config->x87_stock_bcd != 0U && irc.has_bcd;
+
     // Same test on the same incoming pool as translate_instruction's decline,
     // so a None reply for a short pool is not reported as UNHANDLED.
     const bool fpr_pool_short =
         !stock_hash_hit && Translator::fpr_pool_too_small(tr, localIR[req.insn_idx].opcode());
-    if (!stock_hash_hit) {
-        try {
-            result = Translator::translate_instruction(
-                &tr, reinterpret_cast<IRBlock*>(req.block), localIR,
-                static_cast<int64_t>(req.num_instrs), static_cast<int64_t>(req.insn_idx));
-        } catch (const std::bad_alloc&) {
-            std::fprintf(stderr, "[rosettax87] translation allocation failed\n");
-            allocation_failed = true;
-        } catch (const RegisterPoolExhausted& e) {
-            // Same exit as an allocation failure: nothing of this request is
-            // published, the guard invalidates the cache and stock translates
-            // the instruction.  The request-level decline is the fallback for
-            // a scratch need the dispatcher's pool check does not know.
-            static int exhausted = 0;
-            if (++exhausted <= 10 || exhausted % 1000 == 0) {
-                const uint16_t op = localIR[req.insn_idx].opcode();
-                std::fprintf(stdout,
-                             "[rosettax87] %s translating %s at idx=%lld/%lld (gpr=%08x "
-                             "fpr=%08x); stock translates it (#%d)\n",
-                             e.what(), op < kOpcodeNames.size() ? kOpcodeNames[op] : "?",
-                             static_cast<long long>(req.insn_idx),
-                             static_cast<long long>(req.num_instrs), tr.free_gpr_mask,
-                             tr.free_fpr_mask, exhausted);
-                std::fflush(stdout);
-            }
-            allocation_failed = true;
-        }
+
+    // On a stock hit or a stock-BCD hit, the translator never runs and
+    // cache_commit's destructor invalidates the persisted X87Cache (it
+    // stays uncommitted below), which is what a None reply that skipped
+    // the translator needs.
+    std::optional<int64_t> result;
+    if (!stock_hash_hit && !stock_bcd_hit) {
+        result = Translator::translate_instruction(
+            &tr, reinterpret_cast<IRBlock*>(req.block), localIR,
+            static_cast<int64_t>(req.num_instrs), static_cast<int64_t>(req.insn_idx));
         if (result.has_value()) {
             irc.next_idx = result.value();
         }
@@ -2545,10 +2542,6 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
     } _cleanup{.insn_buf = insnGrew ? localInsnData : nullptr,
                .lists = {localPushed[0], localPushed[1], localPushed[2], localPushed[3],
                          localPushed[4], localPushed[5]}};
-
-    if (allocation_failed) {
-        return out;
-    }
 
     if (result.has_value()) {
         // Reserve in the parent with its native allocator before publishing any
@@ -2656,7 +2649,14 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
     // appended lengths). x87_cache is NOT
     // written to the tracee — it lives in g_x87Cache — so the tracee's TR needs
     // no enlargement and the M2 install needs no TR-size patch.
-    if (!writeTranslate(parentTask, req.tr_addr, &tr, kStockTRSize)) {
+    //
+    // A decline after an allocation failure publishes nothing: the translator
+    // already put the result back as the request found it
+    // (decline_after_alloc_failure), so the tracee's TR is current and stock
+    // translates the instruction from it.  Every other None reply still
+    // writes the TR back, as above.
+    if (tr.alloc_failure == nullptr &&
+        !writeTranslate(parentTask, req.tr_addr, &tr, kStockTRSize)) {
         return out;
     }
 
@@ -2693,10 +2693,39 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
             kOpcodeName_fxrstor,  // SSE-era extended
         };
         const uint16_t op = localIR[req.insn_idx].opcode();
-        // stock_hash_hit: the None reply is a deliberate whole-block
-        // exclusion, not a missing handler.  fpr_pool_short: stock's cached
-        // XMM scalars left too few scratch FPRs; the translator logged it.
-        const bool deliberate = stock_hash_hit || fpr_pool_short ||
+        // The translator ran out of scratch registers and put the request
+        // back as it found it (Translator::translate_instruction).  Stock
+        // translates this instruction and the rest of the block, whose
+        // requests come back declined without a line of their own.  One line
+        // per failure, since each one is a pressure-model bug.
+        if (tr.alloc_failure != nullptr) {
+            if (!irc.hash_valid) {
+                irc.hash = profile::hash_ir_stream(localIR, req.num_instrs);
+                irc.hash_valid = true;
+            }
+            const uint64_t n = g_statAllocDeclines.fetch_add(1, std::memory_order_relaxed) + 1;
+            const char* name = (op < kOpcodeNames.size()) ? kOpcodeNames[op] : "?";
+            char line[224];
+            snprintf(line, sizeof(line),
+                     "[rosettax87] %s failed in block hash=0x%016llx at %s idx=%llu/%llu; "
+                     "declined to stock with the rest of the block (#%llu)\n",
+                     tr.alloc_failure, static_cast<unsigned long long>(irc.hash), name,
+                     static_cast<unsigned long long>(req.insn_idx),
+                     static_cast<unsigned long long>(req.num_instrs),
+                     static_cast<unsigned long long>(n));
+            fputs(line, stdout);
+            fflush(stdout);
+            if (FILE* df = diagLog()) {
+                fputs(line, df);
+                fflush(df);
+            }
+        }
+        // stock_hash_hit, stock_bcd_hit, fpr_pool_short: the None reply is a
+        // deliberate whole-block exclusion, not a missing handler.
+        const bool declined_block =
+            tr.x87_cache.declined_block == reinterpret_cast<const IRBlock*>(req.block);
+        const bool deliberate = stock_hash_hit || stock_bcd_hit || fpr_pool_short ||
+                                tr.alloc_failure != nullptr || declined_block ||
                                 std::ranges::find(kKnownFallThrough, op) != kKnownFallThrough.end();
         if (!deliberate && out.stock_fallback_safe) {
             const char* name = (op < kOpcodeNames.size()) ? kOpcodeNames[op] : "?";
@@ -2888,13 +2917,15 @@ void* reporterEntry(void* /*arg*/) {
         // cumulative hits/misses so rates are readable at a glance.
         fprintf(stdout,
                 "[rosettax87] sidecar: %llu req/s (total %llu) vm/req=%.2f "
-                "ir=%llu/%llu tco=%llu\n",
+                "ir=%llu/%llu tco=%llu alloc_declines=%llu\n",
                 static_cast<unsigned long long>(delta / kReporterPeriodSec),
                 static_cast<unsigned long long>(cur),
                 static_cast<double>(vm_delta) / static_cast<double>(delta),
                 static_cast<unsigned long long>(g_statIrHits.load(std::memory_order_relaxed)),
                 static_cast<unsigned long long>(g_statIrMisses.load(std::memory_order_relaxed)),
-                static_cast<unsigned long long>(g_statTcoHits.load(std::memory_order_relaxed)));
+                static_cast<unsigned long long>(g_statTcoHits.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(
+                    g_statAllocDeclines.load(std::memory_order_relaxed)));
         fflush(stdout);
     }
 }

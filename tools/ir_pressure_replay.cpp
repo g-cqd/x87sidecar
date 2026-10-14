@@ -4,6 +4,19 @@
 //
 // Usage:
 //   ir_pressure_replay <ir_blob> [--fpr-pool N] [--gpr-pool N] [--no-split] [--log]
+//                      [--no-native-slots]
+//
+// --fpr-pool N narrows only the gate (X87_FPR_POOL_LIMIT); the FPR mask the
+// lowering draws from is always the default eight.  --gpr-pool N (5-8)
+// narrows the gate and also the GPR mask the lowering draws from, so a GPR
+// model undercount asserts here.  The direct and fusion translators have
+// no pressure gate and expect most of the eight scratch GPRs, so below 8
+// a blob can also assert outside the IR path (on the shipped blobs, the
+// same pools assert with X87_DISABLE_X87_IR set).  The replay runs with
+// X87_NATIVE_SLOTS on, as the sidecar does by default, where an IR read of
+// a register still in its 80-bit format costs three more GPRs
+// (peak_live_gprs); --no-native-slots replays with X87_NATIVE_SLOTS=0.
+// --native-slots is accepted and changes nothing.
 //
 // <ir_blob> is a raw IRInstr[] file, no header.  Produced by
 //   profile_analyze --dump-ir-binary 0xH out.ir <profile.prof>
@@ -63,7 +76,31 @@ struct ReplayStats {
     uint16_t tally_max_gpr_peak = 0;
 };
 
-ReplayStats runOnce(const std::vector<IRInstr>& instrs, const RosettaConfig& cfg) {
+// The scratch GPR mask handed to the translator for a pool of `gpr_pool`
+// registers (0 = all eight).  Lowering then really draws from that many,
+// so a GPR model undercount asserts in the replay instead of borrowing a
+// register the gate did not count.  Slots are dropped in an order that
+// keeps the ones the lowering takes by index (alloc_gpr: 0, 1, 2 for
+// Xbase/Wd_top/Wd_tmp, 3 for the RC cache, 6 for Xst_base): 7 first (only
+// the GS TLS base routine takes it by index), then 5 and 4.  Returns 0
+// for a pool below 5, which would remove a slot taken by index.
+uint32_t gpr_mask_for_pool(int gpr_pool) {
+    if (gpr_pool <= 0 || gpr_pool >= 8) {
+        return kGprScratchMask;
+    }
+    if (gpr_pool < 5) {
+        return 0;
+    }
+    static constexpr int kDropOrder[3] = {7, 5, 4};
+    uint32_t mask = kGprScratchMask;
+    for (int k = 0; k < 8 - gpr_pool; k++) {
+        mask &= ~(1U << kGprScratchPool[kDropOrder[k]]);
+    }
+    return mask;
+}
+
+ReplayStats runOnce(const std::vector<IRInstr>& instrs, const RosettaConfig& cfg,
+                    uint32_t gpr_mask) {
     static ThreadContextOffsets stub_tco{};
 
     TranslationResult result{};
@@ -72,7 +109,7 @@ ReplayStats runOnce(const std::vector<IRInstr>& instrs, const RosettaConfig& cfg
     result.insn_buf.end = 0;
     result.insn_buf.end_cap = kBufSize;
     result.insn_buf.use_heap = 1;
-    result.free_gpr_mask = kGprScratchMask;
+    result.free_gpr_mask = gpr_mask;
     result.free_fpr_mask = kFprScratchMask;
     result._unoccupied_temporary_fprs_for_xmm_scalars = kFprScratchMask;
     result._pinned_temporary_scalars = 0;
@@ -119,6 +156,7 @@ int main(int argc, char** argv) try {
     bool no_split = false;
     bool no_remat = false;
     bool log_split = false;
+    bool native_slots = true;
     uint64_t runtime_version_arg = 0;
     bool runtime_version_arg_set = false;
 
@@ -137,18 +175,24 @@ int main(int argc, char** argv) try {
             runtime_version_arg_set = true;
         } else if (a == "--log") {
             log_split = true;
+        } else if (a == "--native-slots") {
+            native_slots = true;
+        } else if (a == "--no-native-slots") {
+            native_slots = false;
         } else if (path == nullptr) {
             path = argv[i];
         } else {
             std::fprintf(stderr,
-                         "usage: %s <ir_blob> [--fpr-pool N] [--gpr-pool N] [--no-split] [--log]\n",
+                         "usage: %s <ir_blob> [--fpr-pool N] [--gpr-pool N] [--no-split] [--log] "
+                         "[--no-native-slots]\n",
                          argv[0]);
             return 2;
         }
     }
     if (path == nullptr) {
         std::fprintf(stderr,
-                     "usage: %s <ir_blob> [--fpr-pool N] [--gpr-pool N] [--no-split] [--log]\n",
+                     "usage: %s <ir_blob> [--fpr-pool N] [--gpr-pool N] [--no-split] [--log] "
+                     "[--no-native-slots]\n",
                      argv[0]);
         return 2;
     }
@@ -197,13 +241,23 @@ int main(int argc, char** argv) try {
     cfg.enable_bridge_v2 = 1;
     cfg.bridge_max_gap = 2;
     cfg.bridge_max_total = 8;
+    cfg.native_transport = 1;
+    cfg.native_slots = native_slots ? 1 : 0;
     cfg.enable_ir_split = no_split ? 0 : 1;
     cfg.enable_ir_remat = (no_split || no_remat) ? 0 : 1;
     cfg.log_ir_split = log_split ? 1 : 0;
     cfg.fpr_pool_limit = static_cast<uint8_t>(fpr_pool);
     cfg.gpr_pool_limit = static_cast<uint8_t>(gpr_pool);
+    // A replay exists to find pressure-model bugs, so a failed allocation
+    // asserts here instead of being declined.
+    cfg.strict_alloc = 1;
 
-    const ReplayStats s = runOnce(instrs, cfg);
+    const uint32_t gpr_mask = gpr_mask_for_pool(gpr_pool);
+    if (gpr_mask == 0) {
+        std::fprintf(stderr, "error: --gpr-pool must be between 5 and 8\n");
+        return 2;
+    }
+    const ReplayStats s = runOnce(instrs, cfg, gpr_mask);
 
     std::printf("instrs=%zu fpr_pool=%s gpr_pool=%s split=%s\n", instrs.size(),
                 fpr_pool > 0 ? std::to_string(fpr_pool).c_str() : "full",

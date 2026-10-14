@@ -29,6 +29,9 @@ enum class FusionId : int {
     fstp_arith_fstp,  // FSTP mem + non-popping ARITH mem + FSTP mem (3-instruction, batched 2-pop)
     fld_gap_fstp,     // FLD m32/m64 + up to 4 independent non-x87 insns + FSTP m32/m64: the copy is
                       // done at the FLD, the FSTP becomes a no-op (net-zero stack, no state RMW)
+    fild_fistp,       // FILD m64 + FISTP/FISTTP m64 as an exact 64-bit copy (the peephole,
+                      // also nested up to three pairs deep, and the IR pass_exact_i64_copy)
+    fld_fstp_m80,     // FLD m80 + FSTP m80 (2-instruction, raw ten-byte copy)
     kCount
 };
 
@@ -56,6 +59,14 @@ struct RosettaConfig {
                                       //   bit-exact and a fused one is not.  The difference
                                       //   amplifies through cancellation (corrupted audio
                                       //   resample steps in Call of Duty 2).
+    uint8_t ignore_ftz_daz;           // X87_IGNORE_FTZ_DAZ        clear FPCR.FZ/FIZ for the
+                                      //   length of each x87 reply and restore them after, so
+                                      //   MXCSR.FTZ/DAZ no longer flush x87 denormals (real
+                                      //   x87 ignores both bits).  Default OFF: when off the
+                                      //   reply boundary is unchanged; when on, every reply
+                                      //   gains 6 instructions (13 and two taken branches
+                                      //   with values on the x87 stack) and, with FTZ or
+                                      //   DAZ set, two FPCR writes (about 20 ns).
     uint8_t enable_fma_reduce;        // X87_ENABLE_FMA_REDUCE     NEON FMA-reduction pass
                                       //                           (default ON, but it only sees
                                       //                           FMAdd nodes pass_fma creates,
@@ -88,7 +99,22 @@ struct RosettaConfig {
                                       //                           is available (0 = off).  Makes
                                       //                           split behavior deterministic in
                                       //                           tests; allocation is unaffected.
-    uint8_t gpr_pool_limit;           // X87_GPR_POOL_LIMIT        test-only GPR-side equivalent.
+    uint8_t gpr_pool_limit;           // X87_GPR_POOL_LIMIT        test-only GPR-side equivalent;
+                                      //                           also clamps the count that lets
+                                      //                           an X87_NATIVE_SLOTS integer
+                                      //                           store convert 80 bits exactly.
+    uint8_t strict_alloc;             // X87_STRICT_ALLOC          assert when a scratch register
+                                      //                           allocation fails, as every
+                                      //                           build did before the decline
+                                      //                           path existed.  Off by default:
+                                      //                           the failing request is then
+                                      //                           declined to stock with one log
+                                      //                           line.  The test harness sets it
+                                      //                           so pressure-model bugs crash.
+    uint32_t fail_alloc_every;        // X87_FAIL_ALLOC_EVERY      test-only fault injection: every
+                                      //                           Nth scratch register allocation
+                                      //                           in the process fails as if the
+                                      //                           pool were empty (0 = off).
     uint8_t enable_bridge;            // X87_ENABLE_BRIDGE         (default ON since 2026-07-04)
                                       //                           run bridging v1: carry one IR
                                       //                           run across short gaps of
@@ -127,6 +153,41 @@ struct RosettaConfig {
     uint8_t log_bridge;               // X87_LOG_BRIDGE            one stderr line per bridged
                                       //                           compile (hash, counts) and per
                                       //                           fallback.
+    uint8_t native_transport;         // X87_NATIVE_TRANSPORT      (default ON) a reply whose x87
+                                      //                           ops are all fild / fist / fistp /
+                                      //                           fisttp / fldcw / fnstcw and the
+                                      //                           no-ops fnop / fdisi / feni
+                                      //                           works on Rosetta's native 80-bit
+                                      //                           slots directly, so int64 values
+                                      //                           held on the x87 stack across
+                                      //                           replies stay exact.  Set =0 to
+                                      //                           put such replies back through
+                                      //                           the binary64 register file (for
+                                      //                           rollback and bisecting only:
+                                      //                           that path rounds |v| >= 2^53).
+    uint8_t precise_faults;           // X87_PRECISE_FAULTS        (default OFF) =1 probes the
+                                      //                           memory operand of a reply's
+                                      //                           first x87 instruction before
+                                      //                           anything in the reply changes
+                                      //                           state, and answers native
+                                      //                           transport runs one instruction
+                                      //                           per reply, so a fault there
+                                      //                           reaches the guest handler with
+                                      //                           a precise context instead of
+                                      //                           aborting the process.  Off, the
+                                      //                           emitted code is the same as
+                                      //                           without the feature.  =2 also
+                                      //                           ends a run before each later
+                                      //                           memory access, so every fault
+                                      //                           is precise; it needs
+                                      //                           native_slots and is 1 without.
+    uint8_t native_slots;             // X87_NATIVE_SLOTS          (default ON) keeps the working
+                                      //                           binary64 value of each x87
+                                      //                           register inside its native
+                                      //                           80-bit slot (+6, stride 10)
+                                      //                           instead of the compact layout,
+                                      //                           and converts per slot.  =0 is
+                                      //                           the kill switch.
 
     // X87_BRIDGE_HASH_LIST / X87_NO_BRIDGE_HASH_LIST — per-block bridging
     // bisect, same semantics and hash key as the rollback lists above:
@@ -165,6 +226,12 @@ struct RosettaConfig {
     // localize a miscompile to "blocks with opcode X" in one run, then narrow
     // by hash.  Resolved to opcode ids at env-parse time.
     std::vector<uint16_t> x87_stock_ops;  // sorted, binary-searched
+
+    // X87_STOCK_BCD=0 keeps blocks containing FBLD / FBSTP in the sidecar.
+    // By default (1) the sidecar hands every such block to stock, whose
+    // 80-bit registers carry all 18 BCD digits; the inline translators go
+    // through binary64 and keep about 16.
+    uint8_t x87_stock_bcd;
 
     // X87_DIAG_DIR — directory for <dir>/x87diag.<pid>.log, where the
     // sidecar mirrors the X87_LOG_HASH_LIST and X87_STOCK_HASH_LIST lines.

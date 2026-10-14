@@ -13,8 +13,9 @@
  *
  * The first sequence is the 2^x chain from issue #23, which lost the effect of
  * `fld1; faddp` in one execution out of thousands in a live game.  The rest is
- * one case per x87 opcode the sidecar translates, so the whole emitter surface
- * is exercised.
+ * one case per x87 opcode the sidecar translates, plus the two paths that copy
+ * fild m64 into fistp m64 as raw bits, so the whole emitter surface is
+ * exercised.
  *
  * argv[1] selects the storm variant (default "all"):
  *   none    no storm (control)
@@ -24,11 +25,15 @@
  *           pages in a loop (translation invalidation)
  * argv[2] is the time budget per case in seconds.  STORM_CASE=<name> runs one
  * case only.  Under the chain cases run in every variant; the per-opcode
- * cases run in "plain" only.
+ * cases run in "plain" only.  Unless X87_NATIVE_SLOTS=0 is in the environment
+ * the held_f80 case runs in "plain" and "modctx" as well: an 80-bit value
+ * held across replies, which the modctx handler replaces in the saved
+ * context.
  */
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,10 +58,56 @@ static volatile sig_atomic_t g_signals = 0;
  * signal delivery. */
 static volatile unsigned long g_iters = 0;
 
+/* The held-f80 case (run_held_case): while g_held_active, the handler looks
+ * for the held 80-bit value among the stack registers of the saved context.
+ * The register file is complete at every point where a signal is
+ * delivered, so the value has to be there with all ten bytes whenever it is
+ * on the stack, never in a rounded form.  In the modctx variant the handler
+ * also replaces it with g_held_edit, which the store at the end of the
+ * iteration then has to write. */
+static unsigned char g_held[10];
+static unsigned char g_held_rounded[10];
+static unsigned char g_held_edit[10];
+static volatile sig_atomic_t g_held_active = 0;
+static volatile sig_atomic_t g_held_seen = 0;
+static volatile sig_atomic_t g_held_bad = 0;
+static volatile sig_atomic_t g_held_edited = 0;
+
+static void held_in_context(ucontext_t* uc) {
+    if (uc->uc_mcsize < sizeof(*uc->uc_mcontext)) {
+        return;
+    }
+    /* __fpu_stmm0..7 are 16-byte records whose first ten bytes are the
+     * physical registers 0..7 (test_x87_signal_context).  Popped registers
+     * keep their bytes, so only valid ones count: the abridged tag word has
+     * a bit per physical register. */
+    unsigned char* st = (unsigned char*)&uc->uc_mcontext->__fs.__fpu_stmm0;
+    const unsigned ftw = uc->uc_mcontext->__fs.__fpu_ftw;
+    for (int i = 0; i < 8; i++) {
+        if (((ftw >> i) & 1U) == 0) {
+            continue;
+        }
+        unsigned char* r = st + 16 * i;
+        if (memcmp(r, g_held, 10) == 0) {
+            g_held_seen++;
+            if (g_variant == V_MODCTX) {
+                memcpy(r, g_held_edit, 10);
+                g_held_edited = 1;
+            }
+        } else if (memcmp(r, g_held_rounded, 10) == 0) {
+            g_held_bad++;
+        }
+    }
+}
+
 static void handler(int sig, siginfo_t* si, void* ctx) {
     (void)sig;
     (void)si;
     g_signals++;
+    if (g_held_active && ctx != NULL) {
+        held_in_context((ucontext_t*)ctx);
+        return;
+    }
     if (g_variant == V_MODCTX && ctx != NULL) {
         ucontext_t* uc = (ucontext_t*)ctx;
         /* Same content written back.  Bit 1 of rflags reads as 1 on every
@@ -124,25 +175,54 @@ static void* jit_thread(void* arg) {
 
 /* ── the x87 sequences ────────────────────────────────────────────────── */
 
-/* Input block, rax points at it.  Offsets are what the asm bodies use. */
+/* Input block, rax points at it.  The asm bodies address its fields through
+ * the OFF_* offsets below, which the static asserts pin to the layout (a
+ * long double is 16-byte aligned, so f80 sits at +48, not right after i64). */
 struct input {
-    double d;          /* +0   */
-    float f;           /* +8   */
-    float pad_f;       /* +12  */
-    int32_t i32;       /* +16  */
-    int32_t pad_i;     /* +20  */
-    int16_t i16;       /* +24  */
-    int16_t pad_s[3];  /* +26  */
-    int64_t i64;       /* +32  */
-    long double f80;   /* +40, 16 bytes */
-    unsigned char bcd[10]; /* +56 */
+    double d;
+    float f;
+    float pad_f;
+    int32_t i32;
+    int32_t pad_i;
+    int16_t i16;
+    int16_t pad_s[3];
+    int64_t i64;
+    long double f80;
+    unsigned char bcd[10];
     unsigned char pad_b[6];
-    uint16_t cw;       /* +72  */
+    uint16_t cw;
     uint16_t pad_c[3];
-    double d2;         /* +80  */
-    double small;      /* +88  */
-    unsigned char scratch[1024] __attribute__((aligned(16))); /* +96 */
+    double d2;
+    double small;
+    unsigned char scratch[1024] __attribute__((aligned(16)));
 };
+
+#define OFF_D 0
+#define OFF_F 8
+#define OFF_I32 16
+#define OFF_I16 24
+#define OFF_I64 32
+#define OFF_F80 48
+#define OFF_BCD 64
+#define OFF_CW 80
+#define OFF_D2 88
+#define OFF_SMALL 96
+#define OFF_SCRATCH 112
+
+_Static_assert(offsetof(struct input, d) == OFF_D, "d offset");
+_Static_assert(offsetof(struct input, f) == OFF_F, "f offset");
+_Static_assert(offsetof(struct input, i32) == OFF_I32, "i32 offset");
+_Static_assert(offsetof(struct input, i16) == OFF_I16, "i16 offset");
+_Static_assert(offsetof(struct input, i64) == OFF_I64, "i64 offset");
+_Static_assert(offsetof(struct input, f80) == OFF_F80, "f80 offset");
+_Static_assert(offsetof(struct input, bcd) == OFF_BCD, "bcd offset");
+_Static_assert(offsetof(struct input, cw) == OFF_CW, "cw offset");
+_Static_assert(offsetof(struct input, d2) == OFF_D2, "d2 offset");
+_Static_assert(offsetof(struct input, small) == OFF_SMALL, "small offset");
+_Static_assert(offsetof(struct input, scratch) == OFF_SCRATCH, "scratch offset");
+/* fxsave needs a 16-byte aligned area and writes 512 bytes. */
+_Static_assert(OFF_SCRATCH % 16 == 0, "scratch alignment");
+_Static_assert(sizeof(((struct input*)0)->scratch) >= 512, "scratch size");
 
 struct result {
     double value;
@@ -170,21 +250,25 @@ static uint64_t as_u64(double d) {
                            "st(5)", "st(6)", "st(7)");                               \
     }
 
-#define D "qword ptr [rax]"
-#define F "dword ptr [rax+8]"
-#define I32 "dword ptr [rax+16]"
-#define I16 "word ptr [rax+24]"
-#define I64 "qword ptr [rax+32]"
-#define F80 "tbyte ptr [rax+40]"
-#define BCD "tbyte ptr [rax+56]"
-#define CW "word ptr [rax+72]"
-#define D2 "qword ptr [rax+80]"
-#define SMALL "qword ptr [rax+88]"
-#define S32 "dword ptr [rax+96]"
-#define S16 "word ptr [rax+96]"
-#define S64 "qword ptr [rax+96]"
-#define S80 "tbyte ptr [rax+96]"
-#define SMEM "[rax+96]"
+#define STR_(x) #x
+#define STR(x) STR_(x)
+#define AT(off) "[rax+" STR(off) "]"
+
+#define D "qword ptr " AT(OFF_D)
+#define F "dword ptr " AT(OFF_F)
+#define I32 "dword ptr " AT(OFF_I32)
+#define I16 "word ptr " AT(OFF_I16)
+#define I64 "qword ptr " AT(OFF_I64)
+#define F80 "tbyte ptr " AT(OFF_F80)
+#define BCD "tbyte ptr " AT(OFF_BCD)
+#define CW "word ptr " AT(OFF_CW)
+#define D2 "qword ptr " AT(OFF_D2)
+#define SMALL "qword ptr " AT(OFF_SMALL)
+#define S32 "dword ptr " AT(OFF_SCRATCH)
+#define S16 "word ptr " AT(OFF_SCRATCH)
+#define S64 "qword ptr " AT(OFF_SCRATCH)
+#define S80 "tbyte ptr " AT(OFF_SCRATCH)
+#define SMEM AT(OFF_SCRATCH)
 
 /* Issue #23's chain: 2^x. */
 X87_SEQ(seq_chain,
@@ -234,6 +318,11 @@ X87_SEQ(seq_fisttp16, "fld " D "\n\tfisttp " S16 "\n\tfild " S16 "\n\t")
 X87_SEQ(seq_fisttp32, "fld " D "\n\tfisttp " S32 "\n\tfild " S32 "\n\t")
 X87_SEQ(seq_fisttp64, "fld " D "\n\tfisttp " S64 "\n\tfild " S64 "\n\t")
 X87_SEQ(seq_fbstp, "fld " D2 "\n\tfbstp " S80 "\n\tfbld " S80 "\n\t")
+/* fild m64 into fistp m64 is a raw 64-bit copy, read back as a double.  The
+ * nop ends the x87 run, so the pair goes to the fild_fistp peephole; without
+ * it the run is long enough for the IR's exact-copy pass. */
+X87_SEQ(seq_fild64_copy, "fild " D "\n\tfistp " S64 "\n\tnop\n\tfld " S64 "\n\t")
+X87_SEQ(seq_fild64_copy_ir, "fild " D "\n\tfistp " S64 "\n\tfld " S64 "\n\t")
 
 /* Arithmetic, register forms. */
 X87_SEQ(seq_fadd_st, "fld " D "\n\tfld " D2 "\n\tfadd st, st(1)\n\tfstp st(1)\n\t")
@@ -316,7 +405,9 @@ X87_SEQ(seq_fxch, "fld " D "\n\tfld " D2 "\n\tfxch\n\tfstp st(1)\n\t")
 X87_SEQ(seq_fxch2, "fld " D "\n\tfld " D2 "\n\tfld1\n\tfxch st(2)\n\tfaddp\n\tfaddp\n\t")
 X87_SEQ(seq_ffree, "fld " D "\n\tfld " D2 "\n\tffree st(1)\n\tfstp st(1)\n\t")
 X87_SEQ(seq_fincdec, "fld " D "\n\tfdecstp\n\tfincstp\n\t")
-X87_SEQ(seq_fldcw, "fldcw " CW "\n\tfld " D "\n\t")
+/* fldcw loads input.cw and puts the caller's control word back afterwards,
+ * so no case changes the control word the later ones run under. */
+X87_SEQ(seq_fldcw, "fnstcw " S16 "\n\tfldcw " CW "\n\tfld " D "\n\tfldcw " S16 "\n\t")
 X87_SEQ(seq_fnstcw, "fld " D "\n\tfnstcw " S16 "\n\tfldcw " S16 "\n\t")
 X87_SEQ(seq_fnstsw, "fld " D "\n\tfnstsw " S16 "\n\t")
 X87_SEQ(seq_fnclex, "fld " D "\n\tfnclex\n\t")
@@ -326,6 +417,18 @@ X87_SEQ(seq_fnsave, "fld " D "\n\tfnsave " SMEM "\n\tfrstor " SMEM "\n\t")
 X87_SEQ(seq_fxsave, "fld " D "\n\tfxsave " SMEM "\n\tfxrstor " SMEM "\n\t")
 X87_SEQ(seq_fnop, "fld " D "\n\tfnop\n\t")
 X87_SEQ(seq_fdisi_feni, "fld " D "\n\t.byte 0xdb, 0xe1\n\t.byte 0xdb, 0xe0\n\t") /* fndisi; fneni */
+
+/* Native transport replies: runs of integer loads and stores only, which the
+ * sidecar emits against the native 80-bit slots.  The jmp ends the run
+ * before the macro's fnstsw and fstp.  transport_round reloads the control
+ * word it just stored, so the run has an fldcw without changing the control
+ * word the later cases run under. */
+X87_SEQ(seq_transport_int,
+        "fild " I64 "\n\tfild " I32 "\n\tfistp " S32 "\n\tfistp " S64 "\n\tfild " S64
+        "\n\tjmp 1f\n1:\n\t")
+X87_SEQ(seq_transport_round,
+        "fld " D "\n\tfld " D "\n\tjmp 1f\n1:\n\tfist " S32 "\n\tfisttp " S16 "\n\tfnstcw " S16
+        "\n\tfldcw " S16 "\n\tfistp " S64 "\n\tfild " S64 "\n\tjmp 2f\n2:\n\t")
 
 /* A long run: many consecutive x87 ops, which the IR path translates as one
  * unit.  A signal inside it makes the runtime step the whole rest of the run. */
@@ -353,7 +456,9 @@ static const struct op_case k_op_cases[] = {
     {"fstp_sti", seq_fstp_sti},   {"fist16", seq_fist16},       {"fist32", seq_fist32},
     {"fistp16", seq_fistp16},     {"fistp32", seq_fistp32},     {"fistp64", seq_fistp64},
     {"fisttp16", seq_fisttp16},   {"fisttp32", seq_fisttp32},   {"fisttp64", seq_fisttp64},
-    {"fbstp", seq_fbstp},         {"fadd_st", seq_fadd_st},     {"faddp", seq_faddp},
+    {"fbstp", seq_fbstp},         {"fild64_copy", seq_fild64_copy},
+    {"fild64_copy_ir", seq_fild64_copy_ir},
+    {"fadd_st", seq_fadd_st},     {"faddp", seq_faddp},
     {"fsub_st", seq_fsub_st},     {"fsubr_st", seq_fsubr_st},   {"fsubp", seq_fsubp},
     {"fsubrp", seq_fsubrp},       {"fmul_st", seq_fmul_st},     {"fmulp", seq_fmulp},
     {"fdiv_st", seq_fdiv_st},     {"fdivr_st", seq_fdivr_st},   {"fdivp", seq_fdivp},
@@ -381,6 +486,7 @@ static const struct op_case k_op_cases[] = {
     {"fnstsw", seq_fnstsw},       {"fnclex", seq_fnclex},       {"fninit", seq_fninit},
     {"fnstenv", seq_fnstenv},     {"fnsave", seq_fnsave},       {"fxsave", seq_fxsave},
     {"fnop", seq_fnop},           {"fdisi_feni", seq_fdisi_feni}, {"longrun", seq_longrun},
+    {"transport_int", seq_transport_int}, {"transport_round", seq_transport_round},
 };
 
 /* ── driver ───────────────────────────────────────────────────────────── */
@@ -510,6 +616,90 @@ static void run_case(const char* name, seq_fn fn, double x, int variant, double 
     }
 }
 
+/* ── a held 80-bit value ──────────────────────────────────────────────── */
+
+/* An 80-bit value loaded in one block and stored in a later one, with two
+ * blocks of x87 arithmetic between them that do not touch it.  Its low
+ * significand bits do not fit binary64, so a round trip through binary64 at
+ * any point shows up in the stored bytes. */
+static void held_seq(const void* src, void* dst, double* out) {
+    static const double k[] = {0.75, 3.0};
+    __asm__ volatile(
+        "fldt (%[src])\n\tjmp 1f\n1:\n\t"
+        "fldl 0(%[k])\n\tfmull 8(%[k])\n\tfaddl 0(%[k])\n\tfstpl 0(%[out])\n\tjmp 1f\n1:\n\t"
+        "fldl 8(%[k])\n\tfsqrt\n\tfstpl 8(%[out])\n\tjmp 1f\n1:\n\t"
+        "fstpt (%[dst])\n"
+        :
+        : [src] "r"(src), [dst] "r"(dst), [out] "r"(out), [k] "r"(k)
+        : "memory", "st", "st(1)");
+}
+
+static void run_held_case(int variant, double budget_s) {
+    const char* only = getenv("STORM_CASE");
+    if (only != NULL && strcmp(only, "held_f80") != 0) {
+        return;
+    }
+    /* pi with the low significand bits set, and the same value rounded to
+     * binary64's 53 bits, which is how a binary64 round trip would leave it. */
+    const uint64_t mant = 0xC90FDAA22168C235ULL;
+    const uint16_t sexp = 0x4000;
+    const uint64_t rounded = mant & ~0x7FFULL;
+    const uint64_t edited = mant ^ 0x2ULL;
+    memcpy(g_held, &mant, 8);
+    memcpy(g_held + 8, &sexp, 2);
+    memcpy(g_held_rounded, &rounded, 8);
+    memcpy(g_held_rounded + 8, &sexp, 2);
+    memcpy(g_held_edit, &edited, 8);
+    memcpy(g_held_edit + 8, &sexp, 2);
+
+    g_variant = variant;
+    g_signals = 0;
+    g_held_seen = 0;
+    g_held_bad = 0;
+    g_storm_run = 1;
+    pthread_t th;
+    const int have_thread = pthread_create(&th, NULL, storm_thread, NULL) == 0;
+
+    unsigned char src[16] __attribute__((aligned(16)));
+    unsigned char dst[16] __attribute__((aligned(16)));
+    double out[2];
+    memset(src, 0, sizeof(src));
+    memcpy(src, g_held, 10);
+    unsigned long iters = 0;
+    unsigned long wrong = 0;
+    unsigned long edits = 0;
+    const double deadline = now_s() + budget_s;
+    while (now_s() < deadline) {
+        for (int k = 0; k < 64; k++) {
+            memset(dst, 0xA5, sizeof(dst));
+            g_held_edited = 0;
+            g_held_active = 1;
+            held_seq(src, dst, out);
+            g_held_active = 0;
+            const int edited_now = g_held_edited;
+            edits += (unsigned long)edited_now;
+            const unsigned char* want = edited_now ? g_held_edit : g_held;
+            if (memcmp(dst, want, 10) != 0 || out[0] != 3.0 || out[1] != sqrt(3.0)) {
+                wrong++;
+            }
+            iters++;
+            g_iters = iters;
+        }
+    }
+    g_storm_run = 0;
+    if (have_thread) {
+        pthread_join(th, NULL);
+    }
+    if (wrong == 0 && g_held_bad == 0) {
+        printf("PASS  held_f80 variant=%s  iters=%lu signals=%d seen=%d edited=%lu\n",
+               variant_name(variant), iters, (int)g_signals, (int)g_held_seen, edits);
+    } else {
+        printf("FAIL  held_f80 variant=%s  wrong=%lu of %lu, rounded in context=%d, signals=%d\n",
+               variant_name(variant), wrong, iters, (int)g_held_bad, (int)g_signals);
+        failures++;
+    }
+}
+
 int main(int argc, char** argv) {
     const char* which = argc > 1 ? argv[1] : "all";
     if (argc > 2) {
@@ -560,6 +750,12 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < sizeof(k_op_cases) / sizeof(k_op_cases[0]); k++) {
                 run_case(k_op_cases[k].name, k_op_cases[k].fn, 0.75, v, g_budget_op, NAN);
             }
+        }
+        /* Under the sidecar an 80-bit value only survives a reply with the
+         * native slots, so the case is left out with X87_NATIVE_SLOTS=0. */
+        const char* slots = getenv("X87_NATIVE_SLOTS");
+        if ((v == V_PLAIN || v == V_MODCTX) && (slots == NULL || strcmp(slots, "0") != 0)) {
+            run_held_case(v, g_budget_chain);
         }
     }
 
