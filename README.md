@@ -79,6 +79,10 @@ The `fbstp` row measures the sidecar's own translation, which now runs only
 with `X87_STOCK_BCD=0`: by default a block containing `fbld` or `fbstp`
 goes to stock, so it runs at the stock figure.
 
+For an independent comparison against both stock Rosetta 2 and the separate
+rosetta3 translator project, using new workloads not drawn from this table,
+see [docs/investigations/rosetta3-comparison-20261014.md](docs/investigations/rosetta3-comparison-20261014.md).
+
 ## How it works
 
 The original in-process design mapped its own executable pages and patched
