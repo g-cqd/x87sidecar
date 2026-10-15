@@ -214,6 +214,48 @@ void register_pool_exhausted_declines() {
           "alloc_free_fpr on an empty pool sets alloc_failure instead of asserting");
 }
 
+void alloc_failure_decline_persists_for_block() {
+    Fixture fixture;
+    std::array<IRInstr, 2> ir{fixture.ir, fixture.ir};
+    fixture.request.instr_array = reinterpret_cast<uint64_t>(ir.data());
+    fixture.request.num_instrs = 2;
+    const auto declines_before = sidecar::g_statAllocDeclines.load();
+
+    // Request A: exhausts the scratch pool -> allocation failure
+    fixture.request.insn_idx = 0;
+    fixture.tr->free_gpr_mask = 0x00C00000U;
+    remote_writes = 0;
+    auto a = fixture.translate();
+    check(!a.reply_some && fixture.tr->insn_buf.end == 0 && remote_writes == 0 &&
+              sidecar::g_statAllocDeclines.load() == declines_before + 1 && fixture.invalidated(),
+          "Request A: allocation failure declines without emission");
+
+    // Request B: stock translated insn 0 itself and asks for insn 1; the pool is full, so an
+    // attempt would succeed, but the block is declined.
+    fixture.request.insn_idx = 1;
+    fixture.tr->free_gpr_mask = kGprScratchMask;
+    std::array<uint8_t, sidecar::kStockTRSize> tr_before{};
+    std::memcpy(tr_before.data(), fixture.tr, tr_before.size());
+    remote_allocations = 0;
+    remote_writes = 0;
+    auto b = fixture.translate();
+    check(!b.reply_some && fixture.tr->insn_buf.end == 0 && remote_allocations == 0 &&
+              std::memcmp(tr_before.data(), fixture.tr, tr_before.size()) == 0 &&
+              sidecar::g_statAllocDeclines.load() == declines_before + 1 && fixture.invalidated(),
+          "Request B: the rest of the block goes to stock without a new emission attempt");
+
+    const auto& cache_b = sidecar::g_x87Cache.at(fixture.request.tr_addr);
+    check(cache_b.declined_block == reinterpret_cast<const IRBlock*>(fixture.request.block),
+          "Request B: declined_block marker persists in cache across None reply");
+
+    // Request C (stock restarts the block): clears the marker because insn_idx <= declined_idx
+    fixture.request.insn_idx = 0;
+    fixture.tr->free_gpr_mask = kGprScratchMask;
+    auto c = fixture.translate();
+    check(c.reply_some && sidecar::g_x87Cache.at(fixture.request.tr_addr).declined_block == nullptr,
+          "Request C: marker cleared when stock restarts the block");
+}
+
 void huge_spare_capacity() {
     Fixture fixture;
     fixture.tr->insn_buf.end_cap = UINT64_C(1) << 61;
@@ -547,5 +589,6 @@ int main() {
                             "FLD1 with no free scratch FPR falls back to stock");
     fpr_pool_short_ends_run();
     register_pool_exhausted_declines();
+    alloc_failure_decline_persists_for_block();
     return failures != 0;
 }

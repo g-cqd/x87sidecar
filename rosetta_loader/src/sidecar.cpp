@@ -2671,6 +2671,19 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
         out.reply_some = true;
         out.value = result.value();
     } else {
+        // The block stock was handed after an allocation failure is the one
+        // part of the cache a None reply keeps: it says what stock translates
+        // (X87Cache::declined_block), not what the sidecar emitted, so it
+        // publishes nothing.  CacheCommitGuard still invalidates the rest of
+        // the entry on this reply.
+        {
+            std::scoped_lock lk(g_x87CacheMu);
+            X87Cache& stored = g_x87Cache[req.tr_addr];
+            stored.declined_block = tr.x87_cache.declined_block;
+            stored.declined_idx = tr.x87_cache.declined_idx;
+            stored.declined_num_instrs = tr.x87_cache.declined_num_instrs;
+            stored.declined_start_pc = tr.x87_cache.declined_start_pc;
+        }
         // The stub's FILTER prologue routes only x87 opcodes to us, so
         // reaching nullopt means the dispatcher returned nullopt for an
         // x87 op.  Two cases:
