@@ -37,7 +37,7 @@ Mach exceptions. Dropping the ptrace attachment and replying to the held
 exception are separate operations. On macOS 26.6.2 (XNU 12377.161.14), the
 classic sequence successfully detached, but the target stopped again after
 the reply to the synthetic SIGSTOP. The sidecar then waited for the stopped
-target to exit. This reproduced on unchanged master after the CI runner
+target to exit. This reproduced on unchanged main after the CI runner
 moved from macOS 26.5.2 to 26.6.2.
 
 That Tahoe kernel family now uses the same reply-before-detach sequence as
@@ -684,6 +684,16 @@ in stock Rosetta. With `X87_NATIVE_SLOTS=0`, though, such a register held
 from one reply to the next is converted at the reply boundary like any
 other, so `fnsave` then stores the default NaN in its place, where stock
 and the native slots keep the ten bytes.
+
+After `fist` and `fistp`, the sidecar leaves the x87 status word's C1 bit
+(0x200) as it was, where stock Rosetta sets or clears it to report the
+direction of the rounding. This is deliberate: none of the sidecar's
+integer-store emitters computes a rounding-direction flag, and, as above,
+it leaves the exception flags, PE (0x20) included, clear. So
+`tests/test_x87_sync_fault.c` masks C1 (0x200) as well as the exception
+flags (0x00ff, PE among them) when it compares the final x87 state of runs
+that may end on different engines: with `X87_FAIL_ALLOC_EVERY` the same
+FIST(P) is translated by the sidecar in one run and by stock in another.
 
 ## Boundary conversion cost
 
