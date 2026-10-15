@@ -28,6 +28,7 @@ kern_return_t observe_write(vm_map_t task, mach_vm_address_t address, vm_offset_
 #include "../rosetta_loader/src/sidecar.cpp"
 #undef mach_vm_write
 #undef mach_vm_allocate
+#include "rosetta_core/ConfigEnv.h"
 #include "rosetta_core/Register.h"
 
 namespace {
@@ -548,6 +549,188 @@ void early_allocation_failure(bool synthetic) {
                     : "early allocation failure preserves stock fallback for a real opcode");
     fail_next_allocation = false;
 }
+// Native-slots replies that start with an integer op, at each scratch FPR pool
+// size.  Each expectation is asserted: kSome means the reply translates, kNone
+// that it is declined cleanly, and kAny makes no claim (the request runs out of
+// GPRs first, a pre-existing path this test does not cover).
+struct ProbeOp {
+    uint16_t opcode;
+    IROperandSize size;
+};
+
+enum class Expect : uint8_t { kNone, kSome, kAny };
+
+struct ProbeRow {
+    const char* name;
+    std::vector<ProbeOp> ops;
+    bool tight_gprs;
+    // The expectation at each of kProbeFprCounts, in order.
+    std::array<Expect, 5> expect;
+};
+
+constexpr std::array<unsigned, 5> kProbeFprCounts{0, 1, 2, 3, 8};
+
+alignas(16) uint8_t probe_memory[64]{};
+
+// The k lowest set bits of mask: the pool stock would leave with k free.
+uint32_t lowest_set_bits(uint32_t mask, unsigned k) {
+    uint32_t chosen = 0;
+    for (unsigned i = 0; i < k; ++i) {
+        chosen |= mask & (0U - mask);
+        mask &= mask - 1;
+    }
+    return chosen;
+}
+
+struct ProbeResult {
+    bool some = false;
+    uint64_t alloc_declines = 0;
+    unsigned remote_allocations = 0;
+    bool insn_buf_empty = false;
+    bool tr_unchanged = false;
+};
+
+ProbeResult probe_request(const ProbeRow& row, unsigned fpr_count) {
+    Fixture fixture;
+    std::vector<IRInstr> instructions(row.ops.size());
+    for (size_t i = 0; i < row.ops.size(); ++i) {
+        instructions[i].set_opcode(row.ops[i].opcode);
+        instructions[i].num_operands = 1;
+        instructions[i].operands[0].abs_mem = {
+            .kind = IROperandKind::AbsMem,
+            .size = row.ops[i].size,
+            .addr_size = IROperandSize::S64,
+            .value = static_cast<int64_t>(reinterpret_cast<uintptr_t>(probe_memory)),
+        };
+    }
+    fixture.request.instr_array = reinterpret_cast<uint64_t>(instructions.data());
+    fixture.request.num_instrs = instructions.size();
+    // The first reply of a block: the fixture's pre-seeded cache claims a run
+    // of two, which would overstate the lookahead for the one-op control.
+    sidecar::g_x87Cache.erase(fixture.request.tr_addr);
+    const uint32_t fprs = lowest_set_bits(kFprScratchMask, fpr_count);
+    fixture.tr->free_fpr_mask = fprs;
+    fixture.tr->_unoccupied_temporary_fprs_for_xmm_scalars = fprs;
+    if (row.tight_gprs) {
+        fixture.tr->free_gpr_mask = lowest_set_bits(kGprScratchMask, 6);
+    }
+    std::array<unsigned char, sidecar::kStockTRSize> tr_before{};
+    std::memcpy(tr_before.data(), fixture.tr, sidecar::kStockTRSize);
+    const auto declines_before = sidecar::g_statAllocDeclines.load();
+    const unsigned allocations_before = remote_allocations;
+    const auto result = fixture.translate();
+    ProbeResult outcome;
+    outcome.some = result.reply_some;
+    outcome.alloc_declines = sidecar::g_statAllocDeclines.load() - declines_before;
+    outcome.remote_allocations = remote_allocations - allocations_before;
+    outcome.insn_buf_empty = fixture.tr->insn_buf.end == 0;
+    outcome.tr_unchanged = std::memcmp(tr_before.data(), fixture.tr, sidecar::kStockTRSize) == 0;
+    return outcome;
+}
+
+bool probe_outcome_ok(unsigned fpr_count, Expect expect, const ProbeResult& outcome) {
+    switch (expect) {
+        case Expect::kSome:
+            // Translating with no FPR must not have gone through the allocation backstop.
+            return outcome.some && (fpr_count != 0 || outcome.alloc_declines == 0);
+        case Expect::kNone:
+            return !outcome.some && outcome.alloc_declines == 0 &&
+                   outcome.remote_allocations == 0 && outcome.insn_buf_empty &&
+                   outcome.tr_unchanged;
+        case Expect::kAny:
+            break;
+    }
+    return true;
+}
+
+void native_slots_int_op_fpr_need() {
+    const RosettaConfig config = load_config_from_env();
+    rosetta_set_config(&config);
+    constexpr std::array<Expect, 5> kNoneThenSome{Expect::kNone, Expect::kSome, Expect::kSome,
+                                                  Expect::kSome, Expect::kSome};
+    constexpr std::array<Expect, 5> kAllSome{Expect::kSome, Expect::kSome, Expect::kSome,
+                                             Expect::kSome, Expect::kSome};
+    constexpr std::array<Expect, 5> kNoneNoneThenAny{Expect::kNone, Expect::kNone, Expect::kAny,
+                                                     Expect::kAny, Expect::kAny};
+    const std::vector<ProbeRow> rows = {
+        {"1 fild m16 / fstp m64",
+         {{kOpcodeName_fild, IROperandSize::S16}, {kOpcodeName_fstp, IROperandSize::S64}},
+         false,
+         kNoneThenSome},
+        {"2 fild m32 / fstp m64",
+         {{kOpcodeName_fild, IROperandSize::S32}, {kOpcodeName_fstp, IROperandSize::S64}},
+         false,
+         kNoneThenSome},
+        {"3 fild m64 / fstp m64",
+         {{kOpcodeName_fild, IROperandSize::S64}, {kOpcodeName_fstp, IROperandSize::S64}},
+         false,
+         kNoneThenSome},
+        {"4 fild m64 / fstp m80",
+         {{kOpcodeName_fild, IROperandSize::S64}, {kOpcodeName_fstp, IROperandSize::S80}},
+         false,
+         kAllSome},
+        {"5 fist m32 / fld m64",
+         {{kOpcodeName_fist, IROperandSize::S32}, {kOpcodeName_fld, IROperandSize::S64}},
+         false,
+         kAllSome},
+        {"6 fistp m32 / fld m64",
+         {{kOpcodeName_fistp, IROperandSize::S32}, {kOpcodeName_fld, IROperandSize::S64}},
+         false,
+         kAllSome},
+        {"7 fisttp m32 / fld m64",
+         {{kOpcodeName_fisttp, IROperandSize::S32}, {kOpcodeName_fld, IROperandSize::S64}},
+         false,
+         kAllSome},
+        {"8 fistp m64 / fld m64",
+         {{kOpcodeName_fistp, IROperandSize::S64}, {kOpcodeName_fld, IROperandSize::S64}},
+         false,
+         kAllSome},
+        {"9a fild m32 / fistp m32",
+         {{kOpcodeName_fild, IROperandSize::S32}, {kOpcodeName_fistp, IROperandSize::S32}},
+         false,
+         kAllSome},
+        {"9b fistp m32 alone", {{kOpcodeName_fistp, IROperandSize::S32}}, false, kAllSome},
+        {"5T fist m32 / fld m64",
+         {{kOpcodeName_fist, IROperandSize::S32}, {kOpcodeName_fld, IROperandSize::S64}},
+         true,
+         kNoneNoneThenAny},
+        {"6T fistp m32 / fld m64",
+         {{kOpcodeName_fistp, IROperandSize::S32}, {kOpcodeName_fld, IROperandSize::S64}},
+         true,
+         kNoneNoneThenAny},
+        {"7T fisttp m32 / fld m64",
+         {{kOpcodeName_fisttp, IROperandSize::S32}, {kOpcodeName_fld, IROperandSize::S64}},
+         true,
+         kNoneNoneThenAny},
+        {"8T fistp m64 / fld m64",
+         {{kOpcodeName_fistp, IROperandSize::S64}, {kOpcodeName_fld, IROperandSize::S64}},
+         true,
+         kNoneNoneThenAny},
+    };
+    for (const auto& row : rows) {
+        for (size_t i = 0; i < kProbeFprCounts.size(); ++i) {
+            const unsigned fpr_count = kProbeFprCounts[i];
+            const Expect expect = row.expect[i];
+            if (expect == Expect::kAny) {
+                continue;
+            }
+            const ProbeResult outcome = probe_request(row, fpr_count);
+            const bool ok = probe_outcome_ok(fpr_count, expect, outcome);
+            const std::string name = std::string(row.name) + " with " + std::to_string(fpr_count) +
+                                     " free FPR(s) is " +
+                                     (expect == Expect::kSome ? "Some" : "None");
+            check(ok, name.c_str());
+            if (!ok) {
+                std::printf(
+                    "      some=%d allocDeclines=%llu remoteAllocations=%u "
+                    "insnBufEmpty=%d trUnchanged=%d\n",
+                    outcome.some, static_cast<unsigned long long>(outcome.alloc_declines),
+                    outcome.remote_allocations, outcome.insn_buf_empty, outcome.tr_unchanged);
+            }
+        }
+    }
+    rosetta_set_config(nullptr);
+}
 }  // namespace
 
 int main() {
@@ -590,5 +773,6 @@ int main() {
     fpr_pool_short_ends_run();
     register_pool_exhausted_declines();
     alloc_failure_decline_persists_for_block();
+    native_slots_int_op_fpr_need();
     return failures != 0;
 }
