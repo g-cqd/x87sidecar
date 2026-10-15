@@ -470,6 +470,23 @@ runs, a bridged region, integer stores, compares, `fucomi` followed by
 `fcmovu`, and a transcendental. When no allocation fails, the emitted code
 is unchanged.
 
+A native-slots reply that starts with `fild`, `fist`, `fistp` or `fisttp` is
+not declined at its entry for lack of scratch FPRs. The native emitters hold
+no FPR: an exact `fild m64`, and an integer store of an ST(0) that still holds
+its 80-bit value, when enough GPRs are free. The plain translators need one
+FPR for `fild` and two for `fist`, `fistp` and `fisttp`. They run for
+`fild m16`, for `fild m32`, for an `fild m64` that a later instruction reads
+as binary64, and for an integer store whose ST(0) is no longer 80-bit or that
+finds too few GPRs free. Which emitter runs is known only after the slot plan,
+so the opcode's own need is checked there, in `translate_instruction_impl`,
+and the entry check covers the other opcodes. `test_sidecar_transaction`
+measures this in `native_slots_int_op_fpr_need`: with 0 free FPRs an exact
+`fild m64` translates, and with 0 or 1 free FPRs `fist`, `fistp` and `fisttp`
+translate when 8 GPRs are free. With no free FPR the plain `fild` cases
+(`fild m16`, `fild m32`, and `fild m64` followed by `fstp m64`) are declined
+cleanly to stock, and with 6 free GPRs the integer stores are declined
+cleanly with 0 or 1 free FPR.
+
 ## Precision and the floating-point environment
 
 The sidecar holds x87 values as binary64 (53-bit significand, 11-bit
