@@ -15,6 +15,7 @@
  * survive: a translator using a slot stock still holds would corrupt them.
  */
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 
 static int failures = 0;
@@ -34,6 +35,8 @@ static void check(const char* name, double got, double expected) {
 struct out {
     double r0, r1;
     float f[8];
+    int32_t i;
+    unsigned char t[10];
 };
 
 static const double kIn[8] = {1.5, -2.25, 3.125, -4.0625, 5.5, -6.75, 7.875, -8.5};
@@ -98,6 +101,40 @@ CASE(mixed_run_k3, CVT_3, "fmul %%st(0), %%st\n\t fsincos\n\t faddp\n\t fmul %%s
 CASE(fmul_k8, CVT_8, "fmul %%st(1), %%st\n\t")
 CASE(fsincos_k8, CVT_8, X_FSINCOS)
 
+/* Pool 0, integer store and integer load.  An FISTP m32 of an ST0 loaded as
+   binary64, and an exact FILD m64 copied to FSTP m80, need no FPR on the
+   native slots and one or two on the plain translators; either way the values
+   and the SSE results must hold.  Their outputs are an int and ten bytes. */
+#define K8_CLOBBERS                                                           \
+    "memory", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", \
+        "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", \
+        "st", "st(1)", "st(2)"
+
+static void fistp_k8(double a, double b, struct out* o) {
+    __asm__ volatile(LOAD8 CVT_8
+                     "fldl %[a]\n\t fistpl %[i]\n\t fldl %[b]\n\t fadd %%st(0), %%st\n\t"
+                     "fstpl %[r0]\n\t" STORE8
+                     : [r0] "=m"(o->r0), [i] "=m"(o->i)
+                     : [in] "r"(kIn), [f] "r"(o->f), [a] "m"(a), [b] "m"(b)
+                     : K8_CLOBBERS);
+}
+
+static void fild_m80_k8(long long l, struct out* o) {
+    __asm__ volatile(LOAD8 CVT_8 "fildll %[l]\n\t fstpt %[t]\n\t" STORE8
+                     : [t] "=m"(o->t[0])
+                     : [in] "r"(kIn), [f] "r"(o->f), [l] "m"(l)
+                     : K8_CLOBBERS);
+}
+
+static void check_bits(const char* name, unsigned long long got, unsigned long long expected) {
+    if (got == expected) {
+        printf("PASS  %-44s  got=0x%llx\n", name, got);
+    } else {
+        printf("FAIL  %-44s  got=0x%llx expected=0x%llx\n", name, got, expected);
+        failures++;
+    }
+}
+
 static void check_sse(const char* name, const struct out* o, int k) {
     /* CVT_8 order: xmm8<-xmm0, xmm9<-xmm1, xmm10..xmm15<-xmm0..xmm5. */
     static const int src[8] = {0, 1, 0, 1, 2, 3, 4, 5};
@@ -145,6 +182,30 @@ int main(void) {
 
     RUN(fmul_k8, 8, a, b, a * b, b);
     RUN(fsincos_k8, 8, a, b, sin(a), cos(a));
+
+    {
+        struct out o;
+        fistp_k8(7.6, b, &o);
+        check_bits("fistp_k8.i", (unsigned long long)(unsigned)o.i, 8);
+        check("fistp_k8.r0", o.r0, 2.0 * b);
+        check_sse("fistp_k8 keeps SSE results", &o, 8);
+    }
+    {
+        struct out o;
+        unsigned long long significand = 0;
+        unsigned sign_exponent;
+        /* 0x7fffffffffffff01 has 63 significant bits and its top bit at 62: the
+           80-bit value has exponent 0x3fff + 62 and significand l << 1, whose
+           explicit integer bit is bit 63. */
+        fild_m80_k8(0x7fffffffffffff01LL, &o);
+        for (int i = 7; i >= 0; i--) {
+            significand = (significand << 8) | o.t[i];
+        }
+        sign_exponent = o.t[8] | (o.t[9] << 8);
+        check_bits("fild_m80_k8.significand", significand, 0xfffffffffffffe02ULL);
+        check_bits("fild_m80_k8.sign_exponent", sign_exponent, 0x3fff + 62);
+        check_sse("fild_m80_k8 keeps SSE results", &o, 8);
+    }
 
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;

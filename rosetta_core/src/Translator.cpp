@@ -56,10 +56,12 @@ static constexpr int kNativeBoundaryFprNeed = 1;  // emit_native_state_boundary
 // _exit and emit_native_slots_export work in GPRs only (the f80 <-> binary64
 // conversions are integer code), and so do translate_fild_native and
 // translate_int_store_native (fist, fistp, fisttp) with the emitters they call
-// (emit_i64_to_f80_slot, emit_f80_slot_to_int).  Its need is therefore the
-// opcode's own, X87Cache::single_op_fpr_need: the plain translators and the
-// single-instruction fast path still allocate FPRs, and no emitter looks at
-// the pool before it does.
+// (emit_i64_to_f80_slot, emit_f80_slot_to_int).  So a reply's entry need is the
+// opcode's own, X87Cache::single_op_fpr_need, for every opcode but fild, fist,
+// fistp and fisttp: the plain translators and the single-instruction fast path
+// still allocate FPRs, and no emitter looks at the pool before it does.  For
+// those four the native emitter may run instead, and it holds no FPR, so their
+// own need is checked after the slot plan, in translate_instruction_impl.
 static constexpr int kNativeSlotsFprNeed = 0;
 static constexpr int kPeepholeFprNeed = 3;        // largest fusion peak measured
 
@@ -682,15 +684,25 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     // boundary this reply would run (kNativeBoundaryFprNeed).  Declined here,
     // before anything is emitted, there is nothing to roll back.  A
     // native-slots reply bypasses that boundary: it is declined when the pool
-    // cannot cover kNativeSlotsFprNeed or the opcode's own need, which also
-    // keeps single_fast and the plain translators, that allocate without
-    // looking at the pool, from starting on an empty one.  A native transport
-    // reply is exempt: its emitters (fild, fist, fistp, fisttp on the native
-    // slots, fldcw, fnstcw, no-ops) allocate no FPR.  alloc_fails below
-    // remains the backstop only for a need this model does not know.
+    // cannot cover kNativeSlotsFprNeed or, for every opcode but the four below,
+    // the opcode's own need, which also keeps the plain translators, that
+    // allocate without looking at the pool, from starting on an empty one.  A
+    // native transport reply is exempt: its emitters (fild, fist, fistp,
+    // fisttp on the native slots, fldcw, fnstcw, no-ops) allocate no FPR.
+    // alloc_fails below remains the backstop only for a need this model does
+    // not know.
     if (native_boundary && !transport) {
-        const int need =
-            reply_fpr_need(op, slots ? kNativeSlotsFprNeed : kNativeBoundaryFprNeed);
+        // A native-slots reply that starts with fild, fist, fistp or fisttp may run a
+        // native emitter, which holds no FPR; whether it does is known only after the
+        // slot plan, in translate_instruction_impl, whose own check against
+        // X87Cache::single_op_fpr_need declines the reply when the plain translator
+        // would run.  So the opcode's own need is not applied here.
+        const bool own_need_deferred =
+            slots && (op == kOpcodeName_fild || op == kOpcodeName_fist || op == kOpcodeName_fistp ||
+                      op == kOpcodeName_fisttp);
+        const int need = own_need_deferred ? kNativeSlotsFprNeed
+                                           : reply_fpr_need(op, slots ? kNativeSlotsFprNeed
+                                                                      : kNativeBoundaryFprNeed);
         if (need > fpr_pool_size(*translation_result)) {
             log_fpr_pool_decline(*translation_result, op, need);
             cache.last_next_idx = -1;
