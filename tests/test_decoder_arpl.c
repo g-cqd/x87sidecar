@@ -135,14 +135,33 @@ __asm__(
     "  .byte 0xcb\n"         /* lret        (far return -> 64-bit) */
 );
 
+/* The same gate with a BCD store (FBSTP) ahead of the ARPL in one block. The
+ * sidecar hands a block holding FBLD/FBSTP to stock, which has no ARPL: the
+ * ARPL request must still be translated by the sidecar, or the process stops. */
+extern uint8_t gate_stub_bcd[];
+__asm__(
+    ".section __TEXT,__text\n"
+    ".align 4\n"
+    ".globl _gate_stub_bcd\n"
+    "_gate_stub_bcd:\n"
+    "  .byte 0x83, 0xec, 0x0c\n"  /* sub $12, %esp                 */
+    "  .byte 0xd9, 0xee\n"        /* fldz                          */
+    "  .byte 0xdf, 0x34, 0x24\n"  /* fbstp (%esp)                  */
+    "  .byte 0x83, 0xc4, 0x0c\n"  /* add $12, %esp                 */
+    "  .byte 0x63, 0xd0\n"        /* arpl %dx, %ax                 */
+    "  .byte 0x57\n"              /* push %edi                     */
+    "  .byte 0x56\n"              /* push %esi                     */
+    "  .byte 0xcb\n"              /* lret                          */
+);
+
 struct __attribute__((packed)) farptr32 {
     uint32_t off;
     uint16_t sel;
 };
 
 /* Run `arpl ax, dx` in 32-bit mode. Returns EAX out; writes EFLAGS out. */
-static uint32_t run_arpl(uint32_t eax, uint32_t edx, uint32_t *eflags_out) {
-    struct farptr32 to32 = {(uint32_t)(uintptr_t)gate_stub, sel_cs32};
+static uint32_t run_arpl(const uint8_t *stub, uint32_t eax, uint32_t edx, uint32_t *eflags_out) {
+    struct farptr32 to32 = {(uint32_t)(uintptr_t)stub, sel_cs32};
     uint64_t in_eax = eax, in_edx = edx;
     uint32_t in_ds32 = sel_ds32, in_cs64 = sel_cs64;
     uint32_t out_eax = 0, out_flags = 0;
@@ -183,17 +202,17 @@ static uint32_t ref_arpl(uint32_t eax, uint32_t edx, int *zf) {
     *zf = 0; return eax;
 }
 
-static void check(uint32_t eax, uint32_t edx) {
+static void check(const uint8_t *stub, const char *name, uint32_t eax, uint32_t edx) {
     int exp_zf;
     uint32_t exp_eax = ref_arpl(eax, edx, &exp_zf);
 
     uint32_t flags;
-    uint32_t got_eax = run_arpl(eax, edx, &flags);
+    uint32_t got_eax = run_arpl(stub, eax, edx, &flags);
     int got_zf = (flags & EFL_ZF) != 0;
 
     if (got_eax != exp_eax || got_zf != exp_zf) {
-        printf("FAIL  arpl eax=%08x edx=%08x -> eax got=%08x exp=%08x  zf got=%d exp=%d\n",
-               eax, edx, got_eax, exp_eax, got_zf, exp_zf);
+        printf("FAIL  %s eax=%08x edx=%08x -> eax got=%08x exp=%08x  zf got=%d exp=%d\n",
+               name, eax, edx, got_eax, exp_eax, got_zf, exp_zf);
         failures++;
     }
 }
@@ -243,8 +262,9 @@ int main(void) {
     for (unsigned di = 0; di < 4; di++)
         for (unsigned si = 0; si < 4; si++)
             for (unsigned u = 0; u < 4; u++) {
-                check((uppers[u] & ~3u) | di, 0x00550000u | si);
-                total++;
+                check(gate_stub, "arpl", (uppers[u] & ~3u) | di, 0x00550000u | si);
+                check(gate_stub_bcd, "arpl after fbstp", (uppers[u] & ~3u) | di, 0x00550000u | si);
+                total += 2;
             }
 
     if (failures == 0) printf("PASS  test_decoder_arpl  (%d cases through 32-bit gate)\n", total);

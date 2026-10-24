@@ -2423,6 +2423,10 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
         }
         maybeEnableX87Trace(parentTask, irc.hash);
     }
+    // Stock has no ARPL (the decode hook invents the opcode), so the stock
+    // lists and the BCD rule below never claim an ARPL request, even in a
+    // block they hand to stock: the translator handles ARPL on its own.
+    const bool is_arpl = localIR[req.insn_idx].opcode() == kOpcodeName_arpl;
     bool stock_hash_hit = false;
     const bool haveStockHashes =
         g_rosetta_config != nullptr && !g_rosetta_config->x87_stock_hash_list.empty();
@@ -2463,6 +2467,7 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
                                                             localIR[i].opcode());
             }
         }
+        stock_hash_hit = stock_hash_hit && !is_arpl;
         if (stock_hash_hit) {
             static int stock_hits = 0;
             ++stock_hits;
@@ -2492,7 +2497,7 @@ TranslateOutcome processTranslateRequestImpl(mach_port_t parentTask, const Trans
     // about 1.7x faster than stock's.  This is the default rather than a
     // diagnostic, so unlike the lists above it logs nothing.  The scan is
     // done once per IR-cache fill (irc.has_bcd).
-    const bool stock_bcd_hit = !stock_hash_hit && g_rosetta_config != nullptr &&
+    const bool stock_bcd_hit = !stock_hash_hit && !is_arpl && g_rosetta_config != nullptr &&
                                g_rosetta_config->x87_stock_bcd != 0U && irc.has_bcd;
 
     // Same test on the same incoming pool as translate_instruction's decline,
