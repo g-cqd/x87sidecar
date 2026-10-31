@@ -1457,7 +1457,7 @@ void lower(Context& ctx, TranslationResult* result) {
             case Op::FStsw: {
                 static constexpr int16_t kSwImm12 = kX87StatusWordOff / 2;  // = 1
 
-                if (n.flags & kFcomFused) {
+                if ((n.flags & kFcomFused) && n.inputs[0] >= 0) {
                     // Fused: retrieve packed CC from the FCmp node.
                     int16_t fcmp_id = n.inputs[0];
                     int Wd_packed = fprs.get(fcmp_id);

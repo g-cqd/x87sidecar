@@ -1007,11 +1007,9 @@ auto emit_add_reg(AssemblerBuffer& buf, int is_64bit, int dst, int lhs, int rhs)
         // Use extended-reg form (UXTX/UXTW)
         int ext = is_64bit ? 3 : 2;
         // emit_add_sub_ext_reg_inner(buf, is_sub=0, set_flags=0, is_64bit, rhs, ext, lhs, dst&0x1F)
-        uint32_t v = 0x0B200000;
-        v |= static_cast<uint32_t>(is_64bit != 0) << 29;  // sf in bit29 of ext-reg form
         // Full encoding: sf|0|0|01011|00|1|Rm|option|imm3|Rn|Rd
         // option=UXTX(011 for 64-bit) or UXTW(010 for 32-bit), imm3=0
-        v = 0x0B200000;
+        uint32_t v = 0x0B200000;
         v |= static_cast<uint32_t>(is_64bit != 0) << 31;
         v |= static_cast<uint32_t>(rhs & 0x1F) << 16;
         v |= static_cast<uint32_t>(ext & 0x7) << 13;

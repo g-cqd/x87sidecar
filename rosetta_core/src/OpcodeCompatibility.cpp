@@ -18,9 +18,9 @@ uint16_t g_host_arpl = kOpcodeName_arpl;
 
 void opcode_set_host_table(const std::vector<std::string>& hostNames) {
     std::unordered_map<std::string, uint16_t> internalByName;
-    for (uint16_t i = 0; i < kOpcodeNames.size(); ++i) {
+    for (size_t i = 0; i < kOpcodeNames.size(); ++i) {
         if (i != kOpcodeName_arpl && kOpcodeNames[i] != nullptr) {
-            internalByName.emplace(kOpcodeNames[i], i);
+            internalByName.emplace(kOpcodeNames[i], static_cast<uint16_t>(i));
         }
     }
     g_host_to_internal.assign(hostNames.size(), kOpcodeUnmapped);
